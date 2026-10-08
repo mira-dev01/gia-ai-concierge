@@ -1,0 +1,53 @@
+{
+  "_note": "SAMPLE DATA for the Gia demo. Stands in for OI bookings. Put your own WhatsApp number (digits only, with country code, e.g. 9198XXXXXXXX) in guest_phone to chat as that guest, or set DEMO_BOOKING_ID in .env.",
+  "bookings": [
+    {
+      "booking_id": "LH-24017",
+      "villa_id": "GOA-ASG-01",
+      "guest_name": "Aarav Mehta",
+      "guest_phone": "919800000001",
+      "language": "en",
+      "check_in": "2026-10-15",
+      "check_out": "2026-10-19",
+      "adults": 6,
+      "children": 2,
+      "pets": 1,
+      "occasion": "Wife's 40th birthday on 17 Oct",
+      "vip": true,
+      "status": "confirmed",
+      "pre_booked_services": ["Breakfast (included)"]
+    },
+    {
+      "booking_id": "LH-24009",
+      "villa_id": "ALB-AWS-02",
+      "guest_name": "Priya Sharma",
+      "guest_phone": "919800000002",
+      "language": "hi",
+      "check_in": "2026-10-07",
+      "check_out": "2026-10-10",
+      "adults": 4,
+      "children": 2,
+      "pets": 0,
+      "occasion": null,
+      "vip": false,
+      "status": "in_stay",
+      "pre_booked_services": ["Breakfast (included)", "Jetty pick-up on arrival"]
+    },
+    {
+      "booking_id": "LH-24021",
+      "villa_id": "LNV-TGR-03",
+      "guest_name": "Kabir Malhotra",
+      "guest_phone": "919800000003",
+      "language": "en",
+      "check_in": "2026-10-24",
+      "check_out": "2026-10-26",
+      "adults": 10,
+      "children": 0,
+      "pets": 0,
+      "occasion": "Company offsite",
+      "vip": false,
+      "status": "confirmed",
+      "pre_booked_services": ["Breakfast (included)", "Private chef (included for 10+)"]
+    }
+  ]
+}
