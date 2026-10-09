@@ -5,12 +5,13 @@ import html
 import logging
 import secrets
 from collections import defaultdict
+from datetime import date
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from . import agent, config, store, whatsapp
+from . import agent, config, scheduler, store, whatsapp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("gia")
@@ -19,6 +20,20 @@ app = FastAPI(title="Gia WhatsApp concierge (Lohono demo)")
 store.init()
 
 _locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # one turn at a time per guest
+
+SCHEDULE_INTERVAL_SECONDS = 300  # how often to check for a due UC-OPS-01 trigger
+
+
+@app.on_event("startup")
+async def _start_scheduler() -> None:
+    async def loop():
+        while True:
+            try:
+                await scheduler.run_once()
+            except Exception:
+                log.exception("UC-OPS-01 schedule run failed")
+            await asyncio.sleep(SCHEDULE_INTERVAL_SECONDS)
+    asyncio.create_task(loop())
 
 STATUS_MESSAGES = {
     "acknowledged": "The team has picked up your request {ref} ({summary}). Expected by {due}.",
@@ -161,8 +176,22 @@ async def dashboard():
         f"{_e(m['body'])}</div>" for m in store.transcript())
 
     bookings = [dict(b, details=store.guest_details(b["booking_id"])) for b in store.all_bookings()]
+    schedules = store.all_schedules()
+    today = store.now().date()
+    pre_arrival = [
+        dict(booking_id=b["booking_id"], guest_name=b["guest_name"],
+             check_in=b["check_in"], days_left=(date.fromisoformat(b["check_in"]) - today).days,
+             **{k: v for k, v in schedules.get(b["booking_id"], {}).items() if k != "booking_id"})
+        for b in store.all_bookings() if b["status"] == "confirmed"
+    ]
     body = (
-        "<h2>Human handoffs (control tower)</h2>"
+        "<h2>Pre-arrival schedule (UC-OPS-01)</h2>"
+        + "<p class=muted>Welcome at booking confirmation, then T-7 and T-1 before check-in. "
+          f"Runs automatically every {SCHEDULE_INTERVAL_SECONDS // 60} min.</p>"
+        + "<form method=post action=/admin/run-schedule><button>Run check now</button></form>"
+        + _table(pre_arrival, ["booking_id", "guest_name", "check_in", "days_left", "welcome_at", "t7_at",
+                               "t7_reminder_at", "t1_at", "t1_host_flag_at"])
+        + "<h2>Human handoffs (control tower)</h2>"
         + _table(store.all_handoffs(), ["id", "at", "urgency", "booking_id", "phone", "reason", "status"])
         + "<h2>Tickets</h2><p class=muted>Changing a status messages the guest on WhatsApp (UC-OPS-05 step 5).</p>"
         + _table(store.all_tickets(), ["ref", "created_at", "booking_id", "category", "severity", "summary",
@@ -203,16 +232,18 @@ async def change_status(ticket_id: int, status: str = Form(...)):
 
 @app.post("/admin/welcome/{booking_id}", dependencies=[Depends(admin)])
 async def send_welcome(booking_id: str):
-    """UC-OPS-01: open the conversation with an approved template (needed outside the 24h window)."""
+    """UC-OPS-01 manual override: open the conversation right now instead of waiting for the schedule."""
     b = store.get_booking(booking_id)
     if not b:
         raise HTTPException(404)
-    params = None if config.WELCOME_TEMPLATE == "hello_world" else [b["guest_name"].split()[0]]
-    result = await whatsapp.send_template(b["guest_phone"], config.WELCOME_TEMPLATE,
-                                          config.WELCOME_TEMPLATE_LANG, params)
-    store.audit(booking_id, "welcome_template", "tier0", {"template": config.WELCOME_TEMPLATE, "result": result})
-    store.log_message(b["guest_phone"], booking_id, "out", f"[template: {config.WELCOME_TEMPLATE}]")
-    store.add_note(b["guest_phone"], f"Gia sent the booking welcome template '{config.WELCOME_TEMPLATE}'")
+    await scheduler.send_welcome(b)
+    return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/run-schedule", dependencies=[Depends(admin)])
+async def run_schedule():
+    """UC-OPS-01 manual trigger: check every booking now instead of waiting for the background loop."""
+    await scheduler.run_once()
     return RedirectResponse("/admin", status_code=303)
 
 

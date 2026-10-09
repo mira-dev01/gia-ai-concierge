@@ -26,7 +26,7 @@ pip install -r requirements.txt
 cp .env.example .env        # then fill it in on your machine; never paste keys into chat
 ```
 
-**1. Try Gia in the terminal first** (only `ANTHROPIC_API_KEY` needed):
+**1. Try Gia in the terminal first** (only `GROQ_API_KEY` needed):
 
 ```bash
 python -m scripts.chat                 # as Priya, in-stay at Casa Alba, Alibaug
@@ -71,6 +71,6 @@ scripts/chat.py   Terminal chat for testing without WhatsApp
 
 ## Notes for going beyond the demo
 
-- Model: `claude-opus-5-5` at `low` effort for fast WhatsApp replies (`GIA_MODEL`, `GIA_EFFORT` in `.env`). Server-side refusal fallbacks are on.
+- Model: `llama-3.3-70b-versatile` on Groq for fast WhatsApp replies (`GIA_MODEL` in `.env`).
 - WhatsApp only allows free-form messages within 24 hours of the guest's last message. Outside that window (T-7, T-1 and late ticket updates) you need approved templates.
 - Not built yet: T-7/T-1 scheduling from OI events, photo evidence and vision checks, SLA breach escalation, trip scoring, voice notes.

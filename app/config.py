@@ -22,9 +22,8 @@ GRAPH_API_VERSION = _get("GRAPH_API_VERSION", "v23.0")
 WELCOME_TEMPLATE = _get("WELCOME_TEMPLATE", "hello_world")
 WELCOME_TEMPLATE_LANG = _get("WELCOME_TEMPLATE_LANG", "en_US")
 
-# Claude (the SDK reads ANTHROPIC_API_KEY itself)
-GIA_MODEL = _get("GIA_MODEL", "claude-opus-5-5")
-GIA_EFFORT = _get("GIA_EFFORT", "low")
+# Groq (the SDK reads GROQ_API_KEY itself)
+GIA_MODEL = _get("GIA_MODEL", "llama-3.3-70b-versatile")
 
 # Demo behaviour
 DEMO_BOOKING_ID = _get("DEMO_BOOKING_ID")  # attach unknown numbers to this booking

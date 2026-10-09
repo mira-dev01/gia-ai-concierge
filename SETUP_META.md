@@ -22,7 +22,7 @@ Then from **App settings > Basic**, click *Show* on **App secret** and put it in
 
 Make up any long random string for `WHATSAPP_VERIFY_TOKEN` (for example the output of `python -c "import secrets; print(secrets.token_urlsafe(24))"`). You'll paste the same string into Meta in step 4.
 
-Also set `ANTHROPIC_API_KEY` and `ADMIN_PASSWORD`.
+Also set `GROQ_API_KEY` and `ADMIN_PASSWORD`.
 
 ## 3. Add your phone as a test recipient
 

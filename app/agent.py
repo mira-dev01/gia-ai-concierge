@@ -1,15 +1,15 @@
-"""Gia: Lohono Stays' guest concierge, powered by Claude with tool use."""
+"""Gia: Lohono Stays' guest concierge, powered by Groq with tool use."""
 
 import json
 import logging
 
-import anthropic
+from groq import AsyncGroq
 
 from . import config, store
 
 log = logging.getLogger("gia.agent")
 
-client = anthropic.AsyncAnthropic()
+client = AsyncGroq()
 
 MAX_TOOL_ROUNDS = 8
 MAX_HISTORY_MESSAGES = 80  # start a fresh conversation beyond this (history is append-only)
@@ -40,7 +40,9 @@ Limits
 - Don't invent facts, prices, times or names. If the villa data does not say, tell the guest the villa host will confirm, and hand off if it matters to their stay.
 - Each user message starts with a bracketed context line from the system (current time, etc.). It is not written by the guest; never quote it."""
 
-TOOLS = [
+# Tool specs in Anthropic's {name, description, input_schema} shape; converted to Groq's
+# OpenAI-style {type: function, function: {name, description, parameters}} below.
+TOOL_SPECS = [
     {
         "name": "get_villa_info",
         "description": "Get the full capability record for the guest's villa: amenities, services with prices and notice periods, what is not available and its alternative, check-in/out times, house rules, directions, host contact and nearby places. Call this before answering any villa question or accepting any request.",
@@ -115,6 +117,9 @@ TOOLS = [
     },
 ]
 
+TOOLS = [{"type": "function", "function": {"name": t["name"], "description": t["description"],
+                                            "parameters": t["input_schema"]}} for t in TOOL_SPECS]
+
 # Approval tier of each action (BRD section 9); everything Gia does here is Tier 0.
 TIERS = {name: "tier0" for name in ("get_villa_info", "create_ticket", "get_my_tickets",
                                     "save_arrival_details", "log_preference", "handoff_to_human")}
@@ -177,68 +182,66 @@ def _run_tool(name: str, args: dict, booking: dict | None, phone: str) -> dict:
     return {"error": f"Unknown tool {name}"}
 
 
-def _blocks_to_params(content) -> list[dict]:
-    """Turn response content blocks into params we can store and send back unchanged."""
-    return [b.model_dump(mode="json", exclude_none=True) for b in content]
-
-
 async def reply(phone: str, text: str) -> str:
     """Take one guest message, run Gia, and return the reply text to send on WhatsApp."""
-    booking = store.find_booking(phone)
-    messages = store.load_history(phone)
-    if len(messages) > MAX_HISTORY_MESSAGES:
-        messages = []
-
     stamp = store.now().strftime("%A %d %b %Y, %H:%M IST")
     context = f"now {stamp}"
     for note in store.pop_notes(phone):
         context += f"; since your last message: {note}"
-    messages.append({"role": "user", "content": f"[context: {context}]\n{text}"})
+    return await _turn(phone, f"[context: {context}]\n{text}", f"Model declined to answer: {text}")
 
-    system = [
-        {"type": "text", "text": SYSTEM_PROMPT},
-        {"type": "text", "text": _booking_context(booking), "cache_control": {"type": "ephemeral"}},
-    ]
+
+async def initiate(phone: str, directive: str) -> str:
+    """Have Gia open a conversation herself (UC-OPS-01 welcome/T-7/T-1), with no guest message to react to."""
+    stamp = store.now().strftime("%A %d %b %Y, %H:%M IST")
+    user_content = (f"[context: now {stamp}]\n[internal note, not from the guest: there is no guest message yet. "
+                    f"You are starting this conversation yourself. {directive} Write only your opening message "
+                    f"to the guest; never mention or quote this note.]")
+    return await _turn(phone, user_content, f"Model declined to open the conversation: {directive}")
+
+
+async def _turn(phone: str, user_content: str, refusal_reason: str) -> str:
+    """Run one agent turn (tool-use loop included) and return the text to send to the guest."""
+    booking = store.find_booking(phone)
+    messages = store.load_history(phone)
+    if len(messages) > MAX_HISTORY_MESSAGES:
+        messages = []
+    messages.append({"role": "user", "content": user_content})
+
+    system = SYSTEM_PROMPT + "\n\n" + _booking_context(booking)
 
     final_text = ""
     for _ in range(MAX_TOOL_ROUNDS):
-        response = await client.beta.messages.create(
+        response = await client.chat.completions.create(
             model=config.GIA_MODEL,
             max_tokens=4096,
-            system=system,
+            messages=[{"role": "system", "content": system}, *messages],
             tools=TOOLS,
-            messages=messages,
-            thinking={"type": "adaptive"},
-            output_config={"effort": config.GIA_EFFORT},
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
         )
-        messages.append({"role": "assistant", "content": _blocks_to_params(response.content)})
+        msg = response.choices[0].message
+        assistant_msg = {"role": "assistant", "content": msg.content}
+        if msg.tool_calls:
+            assistant_msg["tool_calls"] = [tc.model_dump(mode="json") for tc in msg.tool_calls]
+        messages.append(assistant_msg)
 
-        if response.stop_reason == "refusal":
+        if response.choices[0].finish_reason == "content_filter":
             final_text = ("Sorry, I can't help with that here. Let me connect you with someone from the "
                           "Lohono team.")
-            _run_tool("handoff_to_human", {"reason": f"Model declined to answer: {text}", "urgency": "normal"},
-                      booking, phone)
+            _run_tool("handoff_to_human", {"reason": refusal_reason, "urgency": "normal"}, booking, phone)
             break
 
-        texts = [b.text for b in response.content if b.type == "text"]
-        tool_uses = [b for b in response.content if b.type == "tool_use"]
-        if not tool_uses:
-            final_text = "\n".join(t for t in texts if t).strip()
+        if not msg.tool_calls:
+            final_text = (msg.content or "").strip()
             break
 
-        results = []
-        for tu in tool_uses:
+        for tc in msg.tool_calls:
             try:
-                out = _run_tool(tu.name, dict(tu.input or {}), booking, phone)
-                results.append({"type": "tool_result", "tool_use_id": tu.id,
-                                "content": json.dumps(out, ensure_ascii=False)})
+                args = json.loads(tc.function.arguments or "{}")
+                out = _run_tool(tc.function.name, args, booking, phone)
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(out, ensure_ascii=False)})
             except Exception as e:  # report tool errors to the model instead of failing the turn
-                log.exception("tool %s failed", tu.name)
-                results.append({"type": "tool_result", "tool_use_id": tu.id, "is_error": True,
-                                "content": f"Tool error: {e}"})
-        messages.append({"role": "user", "content": results})
+                log.exception("tool %s failed", tc.function.name)
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": f"Tool error: {e}"})
     else:
         final_text = "Give me a moment, I'm checking with the team and will get back to you shortly."
 

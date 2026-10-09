@@ -52,6 +52,9 @@ def init() -> None:
             CREATE TABLE IF NOT EXISTS seen_messages (id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS pending_notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT, note TEXT);
+            CREATE TABLE IF NOT EXISTS concierge_schedule (
+                booking_id TEXT PRIMARY KEY, welcome_at TEXT, t7_at TEXT, t7_reminder_at TEXT,
+                t1_at TEXT, t1_host_flag_at TEXT);
             """
         )
 
@@ -90,7 +93,7 @@ def first_time_seen(message_id: str) -> bool:
             return False
 
 
-# ---- conversation state (Claude message history, append-only) ----
+# ---- conversation state (Groq message history, append-only) ----
 
 def load_history(phone: str) -> list:
     with _db() as c:
@@ -265,3 +268,44 @@ def pop_notes(phone: str) -> list[str]:
         rows = c.execute("SELECT id, note FROM pending_notes WHERE phone = ? ORDER BY id", (phone,)).fetchall()
         c.execute("DELETE FROM pending_notes WHERE phone = ?", (phone,))
     return [r["note"] for r in rows]
+
+
+# ---- pre-arrival schedule (UC-OPS-01: welcome, T-7, T-1) ----
+
+SCHEDULE_FIELDS = ("welcome_at", "t7_at", "t7_reminder_at", "t1_at", "t1_host_flag_at")
+
+
+def get_schedule(booking_id: str) -> dict:
+    with _db() as c:
+        row = c.execute("SELECT * FROM concierge_schedule WHERE booking_id = ?", (booking_id,)).fetchone()
+    return dict(row) if row else {"booking_id": booking_id, **{f: None for f in SCHEDULE_FIELDS}}
+
+
+def mark_schedule(booking_id: str, **fields) -> None:
+    """Set one or more schedule timestamps for a booking, keeping the others as they were."""
+    sched = get_schedule(booking_id)
+    sched.update(fields)
+    with _db() as c:
+        c.execute(
+            "INSERT INTO concierge_schedule (booking_id, welcome_at, t7_at, t7_reminder_at, t1_at, t1_host_flag_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(booking_id) DO UPDATE SET "
+            "welcome_at=excluded.welcome_at, t7_at=excluded.t7_at, t7_reminder_at=excluded.t7_reminder_at, "
+            "t1_at=excluded.t1_at, t1_host_flag_at=excluded.t1_host_flag_at",
+            (booking_id, sched["welcome_at"], sched["t7_at"], sched["t7_reminder_at"],
+             sched["t1_at"], sched["t1_host_flag_at"]),
+        )
+
+
+def all_schedules() -> dict[str, dict]:
+    with _db() as c:
+        rows = c.execute("SELECT * FROM concierge_schedule").fetchall()
+    return {r["booking_id"]: dict(r) for r in rows}
+
+
+def guest_replied_since(phone: str, since_iso: str) -> bool:
+    with _db() as c:
+        row = c.execute(
+            "SELECT 1 FROM transcript WHERE phone = ? AND direction = 'in' AND at > ? LIMIT 1",
+            (phone, since_iso),
+        ).fetchone()
+    return row is not None
