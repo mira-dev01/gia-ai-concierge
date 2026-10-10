@@ -5,7 +5,7 @@ import logging
 
 from groq import AsyncGroq
 
-from . import config, store
+from . import config, store, tickets
 
 log = logging.getLogger("gia.agent")
 
@@ -31,7 +31,7 @@ What you can do
    - Requests for a service still need confirmation from the provider: say "I've requested it and will confirm shortly", not "it's booked".
 3. Collect arrival details before check-in (UC-OPS-02): arrival time, transport needs, guest names, dietary needs, allergies, occasions, children and pet details. Ask naturally, one or two things at a time, never as a form. Save what you learn with save_arrival_details.
 4. Log preferences (UC-OPS-09): whenever the guest reveals a lasting preference (food, room setup, activities, occasions, routines), call log_preference with the guest's own words as the source quote. Do this silently; don't announce it.
-5. Hand off to a person (UC-OPS-10) with handoff_to_human when: the guest asks for a person; the guest is clearly upset or the same issue failed twice; anything involving safety, a medical issue, police, a fire, a gas leak, an injury or a missing person (urgency "urgent"). For safety or medical issues, tell the guest a named person is taking over right away and give the host's phone number from the villa data; for medical emergencies also tell them to call 112.
+5. Hand off to a person (UC-OPS-10) with handoff_to_human when: the guest asks for a person; the guest is clearly upset or the same issue failed twice; anything involving safety, a medical issue, police, a fire, a gas leak, an injury or a missing person (urgency "urgent"). For safety or medical issues, tell the guest a named person is taking over right away and give the on-ground contact's phone number from the villa data; for medical emergencies also tell them to call 112.
 6. Report status: use get_my_tickets when the guest asks about an earlier request.
 
 Limits
@@ -45,7 +45,7 @@ Limits
 TOOL_SPECS = [
     {
         "name": "get_villa_info",
-        "description": "Get the full capability record for the guest's villa: amenities, services with prices and notice periods, what is not available and its alternative, check-in/out times, house rules, directions, host contact and nearby places. Call this before answering any villa question or accepting any request.",
+        "description": "Get the full capability record for the guest's villa: amenities, services with prices and notice periods, what is not available and its alternative, check-in/out times, house rules, directions, host contact, the on-ground contact (caretaker) to give guests, and nearby places. Call this before answering any villa question or accepting any request.",
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -155,7 +155,7 @@ def _run_tool(name: str, args: dict, booking: dict | None, phone: str) -> dict:
     store.audit(booking_id, name, TIERS.get(name, "tier0"), args)
 
     if name == "handoff_to_human":
-        handoff_id = store.create_handoff(booking_id, phone, args.get("reason", ""), args.get("urgency", "normal"))
+        handoff_id = tickets.raise_handoff(booking, phone, args.get("reason", ""), args.get("urgency", "normal"))
         villa = store.get_villa(booking["villa_id"]) if booking else None
         log.warning("HANDOFF #%s (%s) for %s: %s", handoff_id, args.get("urgency"), phone, args.get("reason"))
         return {"handoff_id": handoff_id, "status": "Control tower notified with the full conversation",
@@ -166,9 +166,13 @@ def _run_tool(name: str, args: dict, booking: dict | None, phone: str) -> dict:
         return {"error": "No booking linked to this guest's number."}
 
     if name == "get_villa_info":
-        return store.get_villa(booking["villa_id"]) or {"error": "Villa not found"}
+        villa = store.get_villa(booking["villa_id"])
+        if not villa:
+            return {"error": "Villa not found"}
+        # The assigned caretaker (else manager, else the host on record) is who the guest should call.
+        return {**villa, "on_ground_contact": store.on_ground_contact(booking["villa_id"])}
     if name == "create_ticket":
-        t = store.create_ticket(booking, phone, args["category"], args["severity"], args["summary"], args["details"])
+        t = tickets.raise_ticket(booking, phone, args["category"], args["severity"], args["summary"], args["details"])
         return {"ticket_ref": t["ref"], "status": t["status"], "assigned_to": t["assignee"],
                 "expected_by": t["due_at"][11:16] + " IST, " + t["due_at"][:10]}
     if name == "get_my_tickets":
@@ -198,6 +202,15 @@ async def initiate(phone: str, directive: str) -> str:
                     f"You are starting this conversation yourself. {directive} Write only your opening message "
                     f"to the guest; never mention or quote this note.]")
     return await _turn(phone, user_content, f"Model declined to open the conversation: {directive}")
+
+
+def record_outbound(phone: str, booking_id: str | None, text: str) -> None:
+    """Add a message sent outside the agent (a WhatsApp template) to Gia's memory of the conversation."""
+    messages = store.load_history(phone)
+    messages += [{"role": "user", "content": "[internal note, not from the guest: Gia sent the guest the next "
+                                             "message as a WhatsApp template. Never quote this note.]"},
+                 {"role": "assistant", "content": text}]
+    store.save_history(phone, booking_id, messages)
 
 
 async def _turn(phone: str, user_content: str, refusal_reason: str) -> str:

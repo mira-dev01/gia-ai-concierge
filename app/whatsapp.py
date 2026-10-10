@@ -29,15 +29,37 @@ async def _post(payload: dict) -> dict:
     return r.json()
 
 
-async def send_text(to: str, body: str) -> None:
+class WhatsAppError(Exception):
+    def __init__(self, code, message: str):
+        super().__init__(f"WhatsApp error {code}: {message}")
+        self.code = code
+
+
+OUTSIDE_SERVICE_WINDOW = 131047  # free text more than 24 hours after the guest's last message
+
+
+def message_id(result: dict) -> str | None:
+    """The WhatsApp message ID of a send, or raise WhatsAppError if Meta rejected it."""
+    if "error" in result:
+        err = result["error"]
+        detail = (err.get("error_data") or {}).get("details") or err.get("message", "")
+        raise WhatsAppError(err.get("code"), detail)
+    messages = result.get("messages") or [{}]
+    return messages[0].get("id")
+
+
+async def send_text(to: str, body: str) -> dict:
+    """Send free text (split if over WhatsApp's limit); returns the first failed chunk's result, else the first."""
+    results = []
     for start in range(0, len(body), MAX_TEXT):
-        await _post({
+        results.append(await _post({
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
             "to": to,
             "type": "text",
             "text": {"preview_url": False, "body": body[start:start + MAX_TEXT]},
-        })
+        }))
+    return next((r for r in results if "error" in r), results[0] if results else {})
 
 
 async def send_template(to: str, name: str, lang: str, body_params: list[str] | None = None) -> dict:
