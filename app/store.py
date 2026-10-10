@@ -1,4 +1,5 @@
-"""SQLite stand-in for OI: bookings, villa capabilities, tickets, preferences, conversations, audit log."""
+"""SQLite stand-in for OI: bookings, villa capabilities and staff, tickets, preferences, conversations,
+the UC-OPS-01 journey, the ticket email outbox and the audit log."""
 
 import json
 import sqlite3
@@ -12,11 +13,11 @@ IST = timezone(timedelta(hours=5, minutes=30))
 SLA_MINUTES = {"urgent": 15, "high": 60, "medium": 180, "low": 720}
 
 _villas = {v["villa_id"]: v for v in json.loads((config.DATA_DIR / "villas.json").read_text())["villas"]}
-_bookings = json.loads((config.DATA_DIR / "bookings.json").read_text())["bookings"]
+_seed_bookings = json.loads((config.DATA_DIR / "bookings.json").read_text())["bookings"]
 
 
 def now() -> datetime:
-    return datetime.now(IST)
+    return datetime.now(IST).replace(microsecond=0)
 
 
 def _db() -> sqlite3.Connection:
@@ -29,6 +30,8 @@ def init() -> None:
     with _db() as c:
         c.executescript(
             """
+            CREATE TABLE IF NOT EXISTS bookings (
+                booking_id TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT);
             CREATE TABLE IF NOT EXISTS conversations (
                 phone TEXT PRIMARY KEY, booking_id TEXT, messages TEXT NOT NULL, updated_at TEXT);
             CREATE TABLE IF NOT EXISTS transcript (
@@ -37,7 +40,7 @@ def init() -> None:
             CREATE TABLE IF NOT EXISTS tickets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, booking_id TEXT, villa_id TEXT, phone TEXT,
                 category TEXT, severity TEXT, summary TEXT, details TEXT, status TEXT,
-                assignee TEXT, created_at TEXT, due_at TEXT, updated_at TEXT);
+                assignee TEXT, created_at TEXT, due_at TEXT, updated_at TEXT, source TEXT);
             CREATE TABLE IF NOT EXISTS preferences (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, booking_id TEXT, guest_name TEXT,
                 category TEXT, preference TEXT, source_quote TEXT, at TEXT);
@@ -52,34 +55,88 @@ def init() -> None:
             CREATE TABLE IF NOT EXISTS seen_messages (id TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS pending_notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT, note TEXT);
-            CREATE TABLE IF NOT EXISTS concierge_schedule (
-                booking_id TEXT PRIMARY KEY, welcome_at TEXT, t7_at TEXT, t7_reminder_at TEXT,
-                t1_at TEXT, t1_host_flag_at TEXT);
+            CREATE TABLE IF NOT EXISTS journey_steps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, booking_id TEXT NOT NULL, step TEXT NOT NULL,
+                due_at TEXT, status TEXT NOT NULL, channel TEXT, template TEXT, wa_message_id TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0, note TEXT, sent_at TEXT, delivered_at TEXT,
+                read_at TEXT, updated_at TEXT, UNIQUE (booking_id, step));
+            CREATE INDEX IF NOT EXISTS journey_steps_wamid ON journey_steps (wa_message_id);
+            CREATE TABLE IF NOT EXISTS villa_settings (
+                villa_id TEXT, use_case TEXT, settings TEXT, updated_at TEXT, PRIMARY KEY (villa_id, use_case));
+            CREATE TABLE IF NOT EXISTS staff (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, phone TEXT, email TEXT, created_at TEXT);
+            CREATE TABLE IF NOT EXISTS villa_staff (
+                villa_id TEXT, role TEXT, staff_id INTEGER, PRIMARY KEY (villa_id, role));
+            CREATE TABLE IF NOT EXISTS outbox_emails (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, ref TEXT, to_addr TEXT, cc TEXT,
+                subject TEXT, body TEXT, status TEXT, attempts INTEGER NOT NULL DEFAULT 0, error TEXT,
+                created_at TEXT, sent_at TEXT);
             """
+        )
+        if "source" not in {r["name"] for r in c.execute("PRAGMA table_info(tickets)")}:
+            c.execute("ALTER TABLE tickets ADD COLUMN source TEXT")  # databases created before UC-OPS-01
+        # Sample bookings count as confirmed the first time the service sees them. An edit to bookings.json
+        # is applied on the next start; otherwise changes made by OI events are kept.
+        for b in _seed_bookings:
+            seed = json.dumps(b, sort_keys=True, ensure_ascii=False)
+            row = c.execute("SELECT data FROM bookings WHERE booking_id = ?", (b["booking_id"],)).fetchone()
+            stored = json.loads(row["data"]) if row else None
+            if stored and stored.get("_seed") == seed:
+                continue
+            merged = {"confirmed_at": now().isoformat(), **(stored or {}), **b, "_seed": seed}
+            c.execute("INSERT INTO bookings (booking_id, data, updated_at) VALUES (?, ?, ?) ON CONFLICT(booking_id) "
+                      "DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+                      (b["booking_id"], json.dumps(merged, ensure_ascii=False), now().isoformat()))
+
+
+# ---- bookings (written by OI booking events) and villas (read-only) ----
+
+def all_bookings() -> list[dict]:
+    with _db() as c:
+        rows = c.execute("SELECT data FROM bookings ORDER BY booking_id").fetchall()
+    return [json.loads(r["data"]) for r in rows]
+
+
+def get_booking(booking_id: str) -> dict | None:
+    with _db() as c:
+        row = c.execute("SELECT data FROM bookings WHERE booking_id = ?", (booking_id,)).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def upsert_booking(booking: dict) -> None:
+    with _db() as c:
+        c.execute(
+            "INSERT INTO bookings (booking_id, data, updated_at) VALUES (?, ?, ?) ON CONFLICT(booking_id) "
+            "DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+            (booking["booking_id"], json.dumps(booking, ensure_ascii=False), now().isoformat()),
         )
 
 
-# ---- bookings and villas (read-only) ----
-
 def find_booking(phone: str) -> dict | None:
-    for b in _bookings:
-        if b["guest_phone"] == phone:
-            return b
+    """The booking a guest's message is about: in-stay first, then the next upcoming stay, then the latest."""
+    mine = sorted((b for b in all_bookings() if b["guest_phone"] == phone),
+                  key=lambda b: b["check_in"], reverse=True)
+    if mine:
+        today = now().date().isoformat()
+
+        def rank(b: dict) -> tuple:
+            if b["status"] == "in_stay":
+                return (0, "")
+            if b["status"] == "confirmed" and b["check_out"] >= today:
+                return (1, b["check_in"])
+            return (2, "")
+        return min(mine, key=rank)
     if config.DEMO_BOOKING_ID:
         return get_booking(config.DEMO_BOOKING_ID)
     return None
 
 
-def get_booking(booking_id: str) -> dict | None:
-    return next((b for b in _bookings if b["booking_id"] == booking_id), None)
-
-
-def all_bookings() -> list[dict]:
-    return _bookings
-
-
 def get_villa(villa_id: str) -> dict | None:
     return _villas.get(villa_id)
+
+
+def all_villas() -> list[dict]:
+    return list(_villas.values())
 
 
 # ---- dedupe of Meta webhook retries ----
@@ -157,16 +214,18 @@ ASSIGNEE_BY_CATEGORY = {
 }
 
 
-def create_ticket(booking: dict, phone: str, category: str, severity: str, summary: str, details: str) -> dict:
+def create_ticket(booking: dict, phone: str, category: str, severity: str, summary: str, details: str,
+                  source: str = "guest", assignee: str | None = None) -> dict:
+    """source 'guest' is a guest's own request (status changes are messaged to them); anything else is internal."""
     created = now()
     due = created + timedelta(minutes=SLA_MINUTES.get(severity, 180))
     with _db() as c:
         cur = c.execute(
             "INSERT INTO tickets (booking_id, villa_id, phone, category, severity, summary, details, status, "
-            "assignee, created_at, due_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)",
+            "assignee, created_at, due_at, updated_at, source) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
             (booking["booking_id"], booking["villa_id"], phone, category, severity, summary, details,
-             ASSIGNEE_BY_CATEGORY.get(category, "Ops agent"), created.isoformat(), due.isoformat(),
-             created.isoformat()),
+             assignee or ASSIGNEE_BY_CATEGORY.get(category, "Ops agent"), created.isoformat(), due.isoformat(),
+             created.isoformat(), source),
         )
         ticket_id = cur.lastrowid
     return get_ticket(ticket_id)
@@ -270,36 +329,27 @@ def pop_notes(phone: str) -> list[str]:
     return [r["note"] for r in rows]
 
 
-# ---- pre-arrival schedule (UC-OPS-01: welcome, T-7, T-1) ----
+# ---- per-guest transcript lookups (ticket context, no-reply rules, WhatsApp's 24-hour window) ----
 
-SCHEDULE_FIELDS = ("welcome_at", "t7_at", "t7_reminder_at", "t1_at", "t1_host_flag_at")
-
-
-def get_schedule(booking_id: str) -> dict:
+def transcript_for(phone: str, limit: int = 20) -> list[dict]:
     with _db() as c:
-        row = c.execute("SELECT * FROM concierge_schedule WHERE booking_id = ?", (booking_id,)).fetchone()
-    return dict(row) if row else {"booking_id": booking_id, **{f: None for f in SCHEDULE_FIELDS}}
+        rows = c.execute("SELECT * FROM transcript WHERE phone = ? ORDER BY id DESC LIMIT ?",
+                         (phone, limit)).fetchall()
+    return [dict(r) for r in reversed(rows)]
 
 
-def mark_schedule(booking_id: str, **fields) -> None:
-    """Set one or more schedule timestamps for a booking, keeping the others as they were."""
-    sched = get_schedule(booking_id)
-    sched.update(fields)
+def booking_record(booking_id: str) -> dict:
+    """Everything logged against one booking: messages, tickets, handoffs, preferences and the audit trail."""
     with _db() as c:
-        c.execute(
-            "INSERT INTO concierge_schedule (booking_id, welcome_at, t7_at, t7_reminder_at, t1_at, t1_host_flag_at) "
-            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(booking_id) DO UPDATE SET "
-            "welcome_at=excluded.welcome_at, t7_at=excluded.t7_at, t7_reminder_at=excluded.t7_reminder_at, "
-            "t1_at=excluded.t1_at, t1_host_flag_at=excluded.t1_host_flag_at",
-            (booking_id, sched["welcome_at"], sched["t7_at"], sched["t7_reminder_at"],
-             sched["t1_at"], sched["t1_host_flag_at"]),
-        )
-
-
-def all_schedules() -> dict[str, dict]:
-    with _db() as c:
-        rows = c.execute("SELECT * FROM concierge_schedule").fetchall()
-    return {r["booking_id"]: dict(r) for r in rows}
+        q = lambda sql: [dict(r) for r in c.execute(sql, (booking_id,)).fetchall()]  # noqa: E731
+        return {
+            "messages": q("SELECT * FROM transcript WHERE booking_id = ? ORDER BY id"),
+            "tickets": [_ticket_view(r) for r in c.execute(
+                "SELECT * FROM tickets WHERE booking_id = ? ORDER BY id", (booking_id,)).fetchall()],
+            "handoffs": q("SELECT * FROM handoffs WHERE booking_id = ? ORDER BY id"),
+            "preferences": q("SELECT * FROM preferences WHERE booking_id = ? ORDER BY id"),
+            "audit": q("SELECT * FROM audit WHERE booking_id = ? ORDER BY id DESC"),
+        }
 
 
 def guest_replied_since(phone: str, since_iso: str) -> bool:
@@ -309,3 +359,193 @@ def guest_replied_since(phone: str, since_iso: str) -> bool:
             (phone, since_iso),
         ).fetchone()
     return row is not None
+
+
+def last_inbound_at(phone: str) -> str | None:
+    with _db() as c:
+        row = c.execute("SELECT MAX(at) AS at FROM transcript WHERE phone = ? AND direction = 'in'",
+                        (phone,)).fetchone()
+    return row["at"]
+
+
+# ---- UC-OPS-01 journey: one row per booking per step ----
+# status: scheduled -> sent -> delivered -> read, or failed / skipped / cancelled
+
+SENT_STATUSES = ("sent", "delivered", "read")
+_STEP_FIELDS = ("due_at", "status", "channel", "template", "wa_message_id", "note", "sent_at",
+                "delivered_at", "read_at")
+
+
+def add_step(booking_id: str, step: str, due_at: str, status: str = "scheduled", note: str | None = None,
+             sent_at: str | None = None) -> None:
+    """Create a step unless the booking already has it."""
+    with _db() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO journey_steps (booking_id, step, due_at, status, note, sent_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (booking_id, step, due_at, status, note, sent_at, now().isoformat()),
+        )
+
+
+def delete_steps(booking_id: str, status: str) -> None:
+    """Drop a booking's steps in one status, e.g. the cancelled ones when the booking is confirmed again."""
+    with _db() as c:
+        c.execute("DELETE FROM journey_steps WHERE booking_id = ? AND status = ?", (booking_id, status))
+
+
+def legacy_schedule(booking_id: str) -> dict:
+    """What the pre-upgrade concierge_schedule table recorded as sent, so an existing database isn't re-sent."""
+    with _db() as c:
+        try:
+            row = c.execute("SELECT * FROM concierge_schedule WHERE booking_id = ?", (booking_id,)).fetchone()
+        except sqlite3.OperationalError:
+            return {}  # a database created after the upgrade has no such table
+    return dict(row) if row else {}
+
+
+def steps_for_booking(booking_id: str) -> dict[str, dict]:
+    with _db() as c:
+        rows = c.execute("SELECT * FROM journey_steps WHERE booking_id = ?", (booking_id,)).fetchall()
+    return {r["step"]: dict(r) for r in rows}
+
+
+def all_steps() -> dict[str, dict[str, dict]]:
+    with _db() as c:
+        rows = c.execute("SELECT * FROM journey_steps").fetchall()
+    out: dict[str, dict[str, dict]] = {}
+    for r in rows:
+        out.setdefault(r["booking_id"], {})[r["step"]] = dict(r)
+    return out
+
+
+def scheduled_steps() -> list[dict]:
+    with _db() as c:
+        rows = c.execute("SELECT * FROM journey_steps WHERE status = 'scheduled' ORDER BY due_at, id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def claim_step(step_id: int) -> bool:
+    """Mark a scheduled step as sent before sending it, so two runs can never both send it."""
+    with _db() as c:
+        cur = c.execute(
+            "UPDATE journey_steps SET status = 'sent', sent_at = ?, attempts = attempts + 1, updated_at = ? "
+            "WHERE id = ? AND status = 'scheduled'",
+            (now().isoformat(), now().isoformat(), step_id),
+        )
+    return cur.rowcount == 1
+
+
+def update_step(step_id: int, **fields) -> None:
+    unknown = set(fields) - set(_STEP_FIELDS)
+    if unknown:
+        raise ValueError(f"Unknown journey step fields: {unknown}")
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    with _db() as c:
+        c.execute(f"UPDATE journey_steps SET {sets}, updated_at = ? WHERE id = ?",
+                  (*fields.values(), now().isoformat(), step_id))
+
+
+def step_by_message_id(wa_message_id: str) -> dict | None:
+    with _db() as c:
+        row = c.execute("SELECT * FROM journey_steps WHERE wa_message_id = ?", (wa_message_id,)).fetchone()
+    return dict(row) if row else None
+
+
+# ---- per-villa settings for each use case (only the villa's overrides are stored) ----
+
+def villa_settings(villa_id: str, use_case: str) -> dict:
+    with _db() as c:
+        row = c.execute("SELECT settings FROM villa_settings WHERE villa_id = ? AND use_case = ?",
+                        (villa_id, use_case)).fetchone()
+    return json.loads(row["settings"]) if row else {}
+
+
+def update_villa_settings(villa_ids: list[str], use_case: str, changes: dict) -> None:
+    for villa_id in villa_ids:
+        merged = {**villa_settings(villa_id, use_case), **changes}
+        with _db() as c:
+            c.execute(
+                "INSERT INTO villa_settings (villa_id, use_case, settings, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(villa_id, use_case) DO UPDATE SET settings = excluded.settings, "
+                "updated_at = excluded.updated_at",
+                (villa_id, use_case, json.dumps(merged), now().isoformat()),
+            )
+
+
+# ---- villa staff: caretakers and managers ----
+
+STAFF_ROLES = ("caretaker", "manager")
+
+
+def add_staff(name: str, phone: str, email: str) -> int:
+    with _db() as c:
+        cur = c.execute("INSERT INTO staff (name, phone, email, created_at) VALUES (?, ?, ?, ?)",
+                        (name, phone, email, now().isoformat()))
+        return cur.lastrowid
+
+
+def all_staff() -> list[dict]:
+    with _db() as c:
+        rows = c.execute("SELECT * FROM staff ORDER BY name").fetchall()
+    return [dict(r) for r in rows]
+
+
+def assign_staff(villa_ids: list[str], role: str, staff_id: int | None) -> None:
+    """Make one person the caretaker (or manager) of each villa; staff_id None clears the role."""
+    with _db() as c:
+        for villa_id in villa_ids:
+            if staff_id is None:
+                c.execute("DELETE FROM villa_staff WHERE villa_id = ? AND role = ?", (villa_id, role))
+            else:
+                c.execute("INSERT INTO villa_staff (villa_id, role, staff_id) VALUES (?, ?, ?) "
+                          "ON CONFLICT(villa_id, role) DO UPDATE SET staff_id = excluded.staff_id",
+                          (villa_id, role, staff_id))
+
+
+def staff_for_villa(villa_id: str) -> dict[str, dict]:
+    with _db() as c:
+        rows = c.execute("SELECT vs.role, s.id, s.name, s.phone, s.email FROM villa_staff vs "
+                         "JOIN staff s ON s.id = vs.staff_id WHERE vs.villa_id = ?", (villa_id,)).fetchall()
+    return {r["role"]: dict(r) for r in rows}
+
+
+def on_ground_contact(villa_id: str) -> dict:
+    """Who the guest should call at the villa: the caretaker, else the manager, else the host on the villa record."""
+    staff = staff_for_villa(villa_id)
+    for role in STAFF_ROLES:
+        if role in staff:
+            return {"name": staff[role]["name"], "phone": staff[role]["phone"], "role": role}
+    villa = get_villa(villa_id) or {}
+    return {**villa.get("host", {}), "role": "host"}
+
+
+# ---- ticket email outbox (mock OI: every ticket and handoff is emailed to the ops inbox) ----
+
+def enqueue_email(kind: str, ref: str, to: str, cc: list[str], subject: str, body: str) -> int:
+    with _db() as c:
+        cur = c.execute(
+            "INSERT INTO outbox_emails (kind, ref, to_addr, cc, subject, body, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (kind, ref, to, json.dumps(cc), subject, body, now().isoformat()),
+        )
+        return cur.lastrowid
+
+
+def pending_emails() -> list[dict]:
+    with _db() as c:
+        rows = c.execute("SELECT * FROM outbox_emails WHERE status = 'pending' ORDER BY id").fetchall()
+    return [dict(r, cc=json.loads(r["cc"] or "[]")) for r in rows]
+
+
+def mark_email(email_id: int, status: str, error: str | None = None) -> None:
+    sent_at = now().isoformat() if status in ("sent", "logged") else None
+    with _db() as c:
+        c.execute("UPDATE outbox_emails SET status = ?, error = ?, attempts = attempts + 1, sent_at = ? "
+                  "WHERE id = ?", (status, error, sent_at, email_id))
+
+
+def outbox(limit: int = 50) -> list[dict]:
+    with _db() as c:
+        rows = c.execute("SELECT id, created_at, kind, ref, to_addr, subject, status, attempts, error, sent_at "
+                         "FROM outbox_emails ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]

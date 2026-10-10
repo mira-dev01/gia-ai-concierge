@@ -6,7 +6,7 @@ Gia is Lohono's AI guest concierge from the *AI-Native Guest Operations BRD*. Th
 |---|---|
 | UC-OPS-05 Handle a guest request | Classifies each message; answers information from the villa capability data; creates an OI-style ticket for service, reservation, housekeeping and maintenance requests, with an SLA time |
 | UC-OPS-05 step 5 | Changing a ticket's status in the ops console messages the guest on WhatsApp automatically |
-| UC-OPS-01 Initiate concierge chat | "Send welcome" in the ops console sends the welcome template to a booking's guest |
+| UC-OPS-01 Initiate concierge chat | Welcome on booking confirmation, T-7 and T-1 before check-in, inside each villa's send window. Late bookings get T-7 merged into the welcome; no reply in 24 h gets one reminder; no reply by T-1 (given at least the reminder delay, 24 h by default, to answer) raises a ticket for the control tower and the villa's caretaker and manager. Every message is logged against the booking with its delivery status. Each booking has its own page in the console with the journey, every message and its tickets. See [UC-OPS-01 in detail](#uc-ops-01-initiate-concierge-chat) |
 | UC-OPS-02 Arrival details | Gia collects arrival time, transport, dietary needs, allergies, occasions, kids and pets, conversationally |
 | UC-OPS-09 Preferences | Lasting preferences are logged with the guest's own words as the source |
 | UC-OPS-10 Human takeover | Requests for a person, money matters, frustration, and any safety or medical issue go to the control tower list (urgent ones flagged) |
@@ -72,5 +72,24 @@ scripts/chat.py   Terminal chat for testing without WhatsApp
 ## Notes for going beyond the demo
 
 - Model: `llama-3.3-70b-versatile` on Groq for fast WhatsApp replies (`GIA_MODEL` in `.env`).
-- WhatsApp only allows free-form messages within 24 hours of the guest's last message. Outside that window (T-7, T-1 and late ticket updates) you need approved templates.
-- Not built yet: T-7/T-1 scheduling from OI events, photo evidence and vision checks, SLA breach escalation, trip scoring, voice notes.
+- WhatsApp only allows free-form messages within 24 hours of the guest's last message. UC-OPS-01 uses templates outside that window; ticket status updates (UC-OPS-05) still need their own template.
+- On Railway, put `DB_PATH` on a volume (for example `/data/gia.db`); otherwise every redeploy starts a fresh database and the sample bookings get their welcome again.
+- Not built yet: photo evidence and vision checks, SLA breach escalation, trip scoring, voice notes.
+
+## UC-OPS-01 Initiate concierge chat
+
+**Trigger.** OI calls `POST /oi/events/booking` with header `X-OI-Secret` and a body like
+`{"event": "confirmed", "booking": {"booking_id": "LH-30001", "guest_name": "Zara Khan", "guest_phone": "919800000009", "villa_id": "LNV-TGR-03", "check_in": "2026-11-20", "check_out": "2026-11-22", "language": "en"}}`.
+`modified` (new dates) moves the steps that haven't gone out; `cancelled` cancels them. The console has a form that sends the same events, and the sample bookings count as confirmed the first time the service starts.
+
+**Steps.** Each booking gets a row per step (`journey_steps`): welcome, T-7, T-7 reminder (only after T-7 goes unanswered) and T-1. Status: scheduled → sent → delivered → read (from WhatsApp delivery receipts), or failed / skipped / cancelled, with the reason in the note. A step is marked sent before it's sent, so overlapping runs can't send it twice. A failed send is retried once after 15 minutes; a second failure raises a ticket for the control tower.
+
+**Template or free text.** If the guest has written in the last 24 hours, Gia writes the step's message herself; otherwise the approved template goes out (`app/wa_templates.py`). Once the guest replies, Gia carries the conversation in free text: arrival details, services (as tickets) and preferences.
+
+**Per-villa settings** (console → Villas & staff, for one villa or a filtered group with checkboxes): on/off, T-7 and T-1 offsets, send window, reminder on/off and delay, no-reply flag on/off. Caretakers and managers are assigned the same way. The caretaker is the contact Gia gives guests at T-1, and caretaker and manager get the no-reply ticket by email (cc) and WhatsApp.
+
+**Mock OI tickets.** `app/tickets.py` saves every ticket and handoff and emails it, with the booking and the recent conversation, to `TICKET_EMAIL_TO` (one address, or several separated by commas) through [Resend](https://resend.com). Set `RESEND_API_KEY` and `RESEND_FROM` (an address on a domain verified in Resend) in `.env`; without a key, emails are logged in the console instead of sent. Emails go through an outbox, so a failed send is retried. Replace `raise_ticket` and `raise_handoff` with OI's endpoint when it's ready.
+
+**Automated check.** `python -m tests.uc_ops_01_check` runs every UC-OPS-01 rule against a frozen clock and a throwaway database, with WhatsApp faked and Resend mocked, so nothing is sent.
+
+**Templates to submit to Meta** (category Utility, English): `gia_welcome`, `gia_welcome_pre_arrival`, `gia_pre_arrival`, `gia_pre_arrival_reminder`, `gia_arrival_t1`, `gia_staff_alert`, with the exact bodies and buttons in `app/wa_templates.py`. Set `WA_TEMPLATES_LIVE=true` once they're approved; until then `hello_world` goes out and the real text is logged.

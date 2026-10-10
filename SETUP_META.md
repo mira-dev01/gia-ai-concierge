@@ -72,13 +72,13 @@ The temporary token dies after about 24 hours. For the demo, create a permanent 
 3. **Generate token** for your app with the permissions `whatsapp_business_messaging` and `whatsapp_business_management`, expiry **Never**.
 4. Replace `WHATSAPP_TOKEN` in `.env` and restart the service.
 
-## 7. Optional: the real welcome message (UC-OPS-01)
+## 7. UC-OPS-01 templates
 
-"Send welcome" in the console uses Meta's built-in `hello_world` template until you make your own:
+Until your templates are approved, `WA_TEMPLATES_LIVE=false` sends Meta's built-in `hello_world` for every UC-OPS-01 step (the real text is still logged in the console). To switch to the real messages:
 
-1. **WhatsApp Manager > Message templates > Create template**, category **Utility**, name `gia_welcome`, language English.
-2. Body, for example: *Hi {{1}}, I'm Gia, Lohono Stays' AI concierge for your upcoming stay. Message me here any time for villa details, chefs, transfers or anything else. A person from our team is always a message away.*
-3. Once it's approved, set `WELCOME_TEMPLATE=gia_welcome` and `WELCOME_TEMPLATE_LANG=en` in `.env`. The guest's first name fills `{{1}}`.
+1. In **WhatsApp Manager > Message templates > Create template**, create each template in `app/wa_templates.py`: category **Utility**, language **English**, the name and body exactly as written there (the `{{1}}`, `{{2}}`... placeholders included), and the quick-reply buttons it lists. Meta asks for a sample value per placeholder; the `params` list next to each body says what goes in each one.
+2. Once all six are approved, set `WA_TEMPLATES_LIVE=true` and restart.
+3. For Hindi, add a Hindi translation under the same template names and set `TEMPLATE_LANGS=en,hi`.
 
 ## 8. Optional: Lohono's own number and name
 

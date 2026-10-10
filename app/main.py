@@ -1,4 +1,4 @@
-"""Gia WhatsApp concierge: Meta webhook + a small ops dashboard for the demo."""
+"""Gia WhatsApp concierge: Meta webhook, mock OI booking events, and a small ops console for the demo."""
 
 import asyncio
 import html
@@ -6,12 +6,13 @@ import logging
 import secrets
 from collections import defaultdict
 from datetime import date
+from urllib.parse import parse_qsl, urlencode
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-from . import agent, config, scheduler, store, whatsapp
+from . import agent, config, scheduler, store, tickets, whatsapp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("gia")
@@ -20,8 +21,9 @@ app = FastAPI(title="Gia WhatsApp concierge (Lohono demo)")
 store.init()
 
 _locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)  # one turn at a time per guest
+_background: set[asyncio.Task] = set()  # keeps fire-and-forget tasks referenced until they finish
 
-SCHEDULE_INTERVAL_SECONDS = 300  # how often to check for a due UC-OPS-01 trigger
+SCHEDULE_INTERVAL_SECONDS = 60  # how often to send due UC-OPS-01 steps and pending ticket emails
 
 
 @app.on_event("startup")
@@ -32,8 +34,13 @@ async def _start_scheduler() -> None:
                 await scheduler.run_once()
             except Exception:
                 log.exception("UC-OPS-01 schedule run failed")
+            try:
+                await tickets.flush_outbox()
+            except Exception:
+                log.exception("Ticket email flush failed")
             await asyncio.sleep(SCHEDULE_INTERVAL_SECONDS)
-    asyncio.create_task(loop())
+    task = asyncio.create_task(loop())
+    _background.add(task)
 
 STATUS_MESSAGES = {
     "acknowledged": "The team has picked up your request {ref} ({summary}). Expected by {due}.",
@@ -71,6 +78,7 @@ async def receive(request: Request, background: BackgroundTasks):
             for st in value.get("statuses", []):
                 if st.get("status") == "failed":
                     log.error("Delivery failed to %s: %s", st.get("recipient_id"), st.get("errors"))
+                background.add_task(scheduler.on_delivery_status, st)  # UC-OPS-01 delivered / read / failed
     return {"ok": True}  # acknowledge fast; Meta expects a 200 quickly
 
 
@@ -108,7 +116,7 @@ async def _converse(phone: str, text: str, send: bool) -> str:
             answer = await agent.reply(phone, text)
         except Exception:
             log.exception("Gia failed for %s", phone)
-            store.create_handoff(booking_id, phone, f"Gia errored on: {text}", "normal")  # NFR-08
+            tickets.raise_handoff(booking, phone, f"Gia errored on: {text}", "normal")  # NFR-08
             answer = "Sorry, I'm having trouble right now. I've asked someone from the Lohono team to reply to you."
         store.log_message(phone, booking_id, "out", answer)
         if send:
@@ -116,7 +124,34 @@ async def _converse(phone: str, text: str, send: bool) -> str:
         return answer
 
 
-# ---------------- Ops dashboard (demo) ----------------
+# ---------------- Mock OI booking events (UC-OPS-01 trigger) ----------------
+
+@app.post("/oi/events/booking")
+async def oi_booking_event(request: Request):
+    """Stand-in for OI's booking webhook.
+
+    Body: {"event": "confirmed" | "modified" | "cancelled", "booking": {"booking_id": ..., "guest_name": ...,
+    "guest_phone": ..., "villa_id": ..., "check_in": "YYYY-MM-DD", "check_out": "YYYY-MM-DD", ...}}
+    Header: X-OI-Secret: <OI_WEBHOOK_SECRET>
+    """
+    if not config.OI_WEBHOOK_SECRET:
+        raise HTTPException(503, "OI_WEBHOOK_SECRET is not set")
+    if not secrets.compare_digest(request.headers.get("X-OI-Secret", ""), config.OI_WEBHOOK_SECRET):
+        raise HTTPException(401, "Bad OI secret")
+    payload = await request.json()
+    try:
+        booking = scheduler.on_booking_event(payload.get("event", ""), payload.get("booking") or {})
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    task = asyncio.create_task(scheduler.run_once())  # send a due welcome now rather than at the next loop
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+    return {"ok": True, "booking": booking, "steps": store.steps_for_booking(booking["booking_id"])}
+
+
+# ---------------- Ops console (demo) ----------------
 
 security = HTTPBasic()
 
@@ -142,25 +177,107 @@ def _table(rows: list[dict], cols: list[str], extra=None) -> str:
     return f"<table><tr>{head}</tr>{body}</table>"
 
 
+def _short(iso: str | None) -> str:
+    return iso[5:16].replace("T", " ") if iso else ""
+
+
+def _back(path: str, back: str, msg: str) -> RedirectResponse:
+    """Redirect to a console page, keeping its filters and showing a one-line message."""
+    params = dict(parse_qsl(back))
+    params["msg"] = msg
+    return RedirectResponse(f"{path}?{urlencode(params)}", status_code=303)
+
+
 PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>Gia ops console</title><meta http-equiv=refresh content=15>
+<title>Gia ops console</title>{refresh}
 <style>
 :root{{--bg:#faf8f4;--fg:#1d1b18;--muted:#7a746b;--line:#e6e0d6;--accent:#8a6a3b}}
 @media (prefers-color-scheme:dark){{:root{{--bg:#16140f;--fg:#efe9df;--muted:#a39b8e;--line:#2f2a22;--accent:#d2ad74}}}}
 body{{font:14px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:16px;max-width:1200px}}
 h1{{font-size:20px;margin:0 0 4px}} h2{{font-size:15px;margin:28px 0 8px;color:var(--accent)}}
-.muted{{color:var(--muted)}} table{{border-collapse:collapse;width:100%;display:block;overflow-x:auto}}
+a{{color:var(--accent)}} .muted{{color:var(--muted)}} .msg{{border:1px solid var(--accent);padding:6px 10px;margin:12px 0}}
+table{{border-collapse:collapse;width:100%;display:block;overflow-x:auto}}
 td,th{{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}}
 th{{font-weight:600;color:var(--muted)}} form{{display:inline}} button{{margin:1px;cursor:pointer}}
+fieldset{{border:1px solid var(--line);margin:12px 0;padding:8px 12px}} label{{margin-right:12px;white-space:nowrap}}
+input[type=number]{{width:4em}}
 .chat{{max-height:420px;overflow:auto;border:1px solid var(--line);padding:8px}}
 .in{{margin:4px 0}} .out{{margin:4px 0 4px 32px;color:var(--accent)}}
 </style></head><body>
-<h1>Gia ops console</h1><div class=muted>Lohono Stays demo · stands in for OI · refreshes every 15s</div>
-{body}</body></html>"""
+<h1>Gia ops console</h1><div class=muted>Lohono Stays demo · stands in for OI ·
+<a href=/admin>Console</a> · <a href=/admin/villas>Villas &amp; staff</a></div>
+{msg}{body}</body></html>"""
+
+
+def _page(body: str, msg: str = "", refresh: bool = False) -> str:
+    return PAGE.format(body=body, msg=f"<div class=msg>{_e(msg)}</div>" if msg else "",
+                       refresh="<meta http-equiv=refresh content=15>" if refresh else "")
+
+
+def _step_cell(st: dict | None) -> str:
+    if not st:
+        return ""
+    when = {"scheduled": st["due_at"], "sent": st["sent_at"], "delivered": st["delivered_at"],
+            "read": st["read_at"]}.get(st["status"]) or st["updated_at"]
+    cell = f"{st['status']} {_short(when)}"
+    if st["channel"]:
+        cell += f" · {st['template'] or 'free text'}"
+    if st["note"]:
+        cell += f" ({st['note']})"
+    return cell
+
+
+def _coverage(all_steps: dict, booking_ids: set[str]) -> str:
+    """Acceptance check: how many bookings have received each UC-OPS-01 message."""
+    groups = {"received": ("delivered", "read"), "sent, no receipt yet": ("sent",), "scheduled": ("scheduled",),
+              "failed": ("failed",), "skipped or cancelled": ("skipped", "cancelled")}
+    lines = []
+    for name in ("welcome", "t7", "t1"):
+        statuses = [all_steps.get(b, {}).get(name, {}).get("status") for b in booking_ids]
+        parts = [f"{n} {label}" for label, group in groups.items() if (n := sum(st in group for st in statuses))]
+        lines.append(f"<b>{scheduler.STEP_LABELS[name]}</b>: {', '.join(parts) or 'none yet'}")
+    return f"<p>{' · '.join(lines)}</p>"
+
+
+@app.get("/admin/bookings/{booking_id}", response_class=HTMLResponse, dependencies=[Depends(admin)])
+async def booking_page(booking_id: str):
+    """Everything on one booking: the UC-OPS-01 journey, every message both ways, tickets and preferences."""
+    b = store.get_booking(booking_id)
+    if not b:
+        raise HTTPException(404)
+    villa = store.get_villa(b["villa_id"]) or {}
+    rec = store.booking_record(booking_id)
+    steps = store.steps_for_booking(booking_id)
+    journey = [{**steps[name], "step": scheduler.STEP_LABELS[name]} for name in scheduler.STEPS if name in steps]
+    chat = "".join(
+        f"<div class={m['direction']}><span class=muted>{_e(_short(m['at']))} "
+        f"{'guest' if m['direction'] == 'in' else 'Gia'}</span> {_e(m['body'])}</div>" for m in rec["messages"])
+    staff = store.staff_for_villa(b["villa_id"])
+    body = (
+        f"<h2>{_e(b['guest_name'])} · {_e(booking_id)}</h2>"
+        f"<p>{_e(villa.get('name', b['villa_id']))}, {_e(villa.get('location'))} · {_e(b['check_in'])} to "
+        f"{_e(b['check_out'])} · status {_e(b['status'])} · +{_e(b['guest_phone'])} · confirmed "
+        f"{_e(_short(b.get('confirmed_at')))}<br>Caretaker: "
+        f"{_e(staff.get('caretaker', {}).get('name', 'not assigned'))} · Manager: "
+        f"{_e(staff.get('manager', {}).get('name', 'not assigned'))}</p>"
+        "<h2>UC-OPS-01 journey</h2>"
+        + _table(journey, ["step", "status", "due_at", "sent_at", "delivered_at", "read_at", "channel", "template",
+                           "attempts", "note"])
+        + "<h2>Messages on this booking</h2><div class=chat>"
+        + (chat or "<p class=muted>No messages yet.</p>") + "</div>"
+        + "<h2>Tickets</h2>"
+        + _table(rec["tickets"], ["ref", "created_at", "source", "category", "severity", "summary", "status",
+                                  "assignee"])
+        + "<h2>Handoffs</h2>" + _table(rec["handoffs"], ["id", "at", "urgency", "reason", "status"])
+        + "<h2>Arrival details</h2><p>" + (_e(d) if (d := store.guest_details(booking_id)) else "None yet.") + "</p>"
+        + "<h2>Preferences</h2>" + _table(rec["preferences"], ["at", "category", "preference", "source_quote"])
+        + "<h2>Audit trail</h2>" + _table(rec["audit"], ["at", "action", "tier", "data"])
+    )
+    return _page(body)
 
 
 @app.get("/admin", response_class=HTMLResponse, dependencies=[Depends(admin)])
-async def dashboard():
+async def dashboard(msg: str = ""):
     def ticket_actions(t):
         return "".join(
             f"<form method=post action=/admin/tickets/{t['id']}/status>"
@@ -168,34 +285,68 @@ async def dashboard():
             for s in STATUS_MESSAGES if s != t["status"]) if t["status"] != "closed" else ""
 
     def booking_actions(b):
-        return (f"<form method=post action=/admin/welcome/{b['booking_id']}><button>Send welcome</button></form>"
+        return (f"<a href=/admin/bookings/{_e(b['booking_id'])}>Open</a> "
                 f"<form method=post action=/admin/reset/{b['guest_phone']}><button>Reset chat</button></form>")
+
+    def journey_actions(r):
+        link = f"<a href=/admin/bookings/{_e(r['booking_id'])}>Open</a> "
+        if r["_welcome_status"] != "scheduled":
+            return link
+        return (link + f"<form method=post action=/admin/welcome/{r['booking_id']}>"
+                f"<button>Send welcome now</button></form>")
 
     chat = "".join(
         f"<div class={m['direction']}><span class=muted>{_e(m['at'][11:16])} {_e(m['phone'])}</span> "
         f"{_e(m['body'])}</div>" for m in store.transcript())
 
     bookings = [dict(b, details=store.guest_details(b["booking_id"])) for b in store.all_bookings()]
-    schedules = store.all_schedules()
+    all_steps = store.all_steps()
     today = store.now().date()
-    pre_arrival = [
-        dict(booking_id=b["booking_id"], guest_name=b["guest_name"],
-             check_in=b["check_in"], days_left=(date.fromisoformat(b["check_in"]) - today).days,
-             **{k: v for k, v in schedules.get(b["booking_id"], {}).items() if k != "booking_id"})
-        for b in store.all_bookings() if b["status"] == "confirmed"
-    ]
+    journey = []
+    for b in store.all_bookings():
+        steps = all_steps.get(b["booking_id"], {})
+        if b["status"] != "confirmed" and not steps:
+            continue
+        villa = store.get_villa(b["villa_id"]) or {}
+        journey.append(dict(
+            booking_id=b["booking_id"], guest=b["guest_name"], villa=villa.get("name", b["villa_id"]),
+            check_in=b["check_in"], days_left=(date.fromisoformat(b["check_in"]) - today).days,
+            booking_status=b["status"], _welcome_status=(steps.get("welcome") or {}).get("status"),
+            **{scheduler.STEP_LABELS[name]: _step_cell(steps.get(name)) for name in scheduler.STEPS}))
+
+    villa_options = "".join(f"<option value={_e(v['villa_id'])}>{_e(v['name'])}</option>" for v in store.all_villas())
     body = (
-        "<h2>Pre-arrival schedule (UC-OPS-01)</h2>"
-        + "<p class=muted>Welcome at booking confirmation, then T-7 and T-1 before check-in. "
-          f"Runs automatically every {SCHEDULE_INTERVAL_SECONDS // 60} min.</p>"
+        "<h2>UC-OPS-01 pre-arrival journey</h2>"
+        + "<p class=muted>Welcome on booking confirmation, then T-7 and T-1 before check-in, inside each villa's "
+          f"send window. Due steps go out every {SCHEDULE_INTERVAL_SECONDS} s. Status: scheduled → sent → "
+          "delivered → read, or failed / skipped / cancelled. Per-villa settings are on "
+          "<a href=/admin/villas>Villas &amp; staff</a>.</p>"
+        + _coverage(all_steps, {r["booking_id"] for r in journey})
         + "<form method=post action=/admin/run-schedule><button>Run check now</button></form>"
-        + _table(pre_arrival, ["booking_id", "guest_name", "check_in", "days_left", "welcome_at", "t7_at",
-                               "t7_reminder_at", "t1_at", "t1_host_flag_at"])
+        + _table(journey, ["booking_id", "guest", "villa", "check_in", "days_left", "booking_status",
+                           *scheduler.STEP_LABELS.values()], journey_actions)
+        + "<h2>Simulate an OI booking event</h2>"
+        + "<p class=muted>Stands in for OI's booking webhook (POST /oi/events/booking). For modified and "
+          "cancelled, only the booking ID and the fields that change are needed.</p>"
+        + "<form method=post action=/admin/oi-event>"
+          "<select name=event><option>confirmed</option><option>modified</option><option>cancelled</option></select> "
+          "<input name=booking_id placeholder='LH-24030' size=9> <input name=guest_name placeholder='Guest name'> "
+          "<input name=guest_phone placeholder='9198XXXXXXXX' size=13> "
+          f"<select name=villa_id><option value=''>Villa</option>{villa_options}</select> "
+          "<label>check-in <input type=date name=check_in></label><label>check-out <input type=date name=check_out></label>"
+          "<select name=language><option value=''>Language</option><option>en</option><option>hi</option></select> "
+          "<button>Send event</button></form>"
         + "<h2>Human handoffs (control tower)</h2>"
         + _table(store.all_handoffs(), ["id", "at", "urgency", "booking_id", "phone", "reason", "status"])
-        + "<h2>Tickets</h2><p class=muted>Changing a status messages the guest on WhatsApp (UC-OPS-05 step 5).</p>"
-        + _table(store.all_tickets(), ["ref", "created_at", "booking_id", "category", "severity", "summary",
-                                       "status", "assignee", "due_at"], ticket_actions)
+        + "<h2>Tickets (mock OI)</h2><p class=muted>Every ticket is emailed to "
+          f"{_e(config.TICKET_EMAIL_TO)}. Changing the status of a guest's own request messages them on "
+          "WhatsApp (UC-OPS-05 step 5); internal tickets don't.</p>"
+        + _table(store.all_tickets(), ["ref", "created_at", "booking_id", "source", "category", "severity",
+                                       "summary", "status", "assignee", "due_at"], ticket_actions)
+        + "<h2>Ticket emails</h2>"
+        + ("<p class=muted>RESEND_API_KEY isn't set, so emails are logged, not sent.</p>"
+           if not config.RESEND_API_KEY or config.DRY_RUN else "")
+        + _table(store.outbox(), ["created_at", "ref", "to_addr", "subject", "status", "attempts", "error"])
         + "<h2>Conversation</h2><div class=chat>" + (chat or "<p class=muted>No messages yet.</p>") + "</div>"
         + "<h2>Try Gia without WhatsApp</h2>"
         + "<form method=post action=/admin/simulate><select name=phone>"
@@ -207,11 +358,11 @@ async def dashboard():
         + _table(store.all_preferences(), ["at", "guest_name", "category", "preference", "source_quote"])
         + "<h2>Bookings and arrival details</h2>"
         + _table(bookings, ["booking_id", "guest_name", "guest_phone", "villa_id", "check_in", "check_out",
-                            "status", "details"], booking_actions)
+                            "status", "confirmed_at", "details"], booking_actions)
         + "<h2>Audit log (NFR-04)</h2>"
         + _table(store.audit_log(), ["at", "booking_id", "action", "tier", "data"])
     )
-    return PAGE.format(body=body)
+    return _page(body, msg, refresh=not msg)
 
 
 @app.post("/admin/tickets/{ticket_id}/status", dependencies=[Depends(admin)])
@@ -221,30 +372,45 @@ async def change_status(ticket_id: int, status: str = Form(...)):
     t = store.set_ticket_status(ticket_id, status)
     if not t:
         raise HTTPException(404)
-    msg = STATUS_MESSAGES[status].format(ref=t["ref"], summary=t["summary"],
-                                         due=t["due_at"][11:16] + " IST")
     store.audit(t["booking_id"], f"ticket_status:{status}", "tier0", {"ticket": t["ref"]})
-    store.log_message(t["phone"], t["booking_id"], "out", msg)
-    store.add_note(t["phone"], f"ops set ticket {t['ref']} to '{status}' and Gia sent the guest: \"{msg}\"")
-    await whatsapp.send_text(t["phone"], msg)
+    if t["source"] in (None, "guest"):  # internal tickets (no-reply flags, delivery failures) aren't the guest's
+        msg = STATUS_MESSAGES[status].format(ref=t["ref"], summary=t["summary"],
+                                             due=t["due_at"][11:16] + " IST")
+        store.log_message(t["phone"], t["booking_id"], "out", msg)
+        store.add_note(t["phone"], f"ops set ticket {t['ref']} to '{status}' and Gia sent the guest: \"{msg}\"")
+        await whatsapp.send_text(t["phone"], msg)
     return RedirectResponse("/admin", status_code=303)
 
 
 @app.post("/admin/welcome/{booking_id}", dependencies=[Depends(admin)])
 async def send_welcome(booking_id: str):
-    """UC-OPS-01 manual override: open the conversation right now instead of waiting for the schedule."""
-    b = store.get_booking(booking_id)
-    if not b:
+    """UC-OPS-01 manual override: send the welcome now instead of waiting for the send window."""
+    if not store.get_booking(booking_id):
         raise HTTPException(404)
-    await scheduler.send_welcome(b)
+    await scheduler.send_now(booking_id, "welcome")
     return RedirectResponse("/admin", status_code=303)
 
 
 @app.post("/admin/run-schedule", dependencies=[Depends(admin)])
 async def run_schedule():
-    """UC-OPS-01 manual trigger: check every booking now instead of waiting for the background loop."""
+    """UC-OPS-01 manual trigger: send due steps now instead of waiting for the background loop."""
     await scheduler.run_once()
+    await tickets.flush_outbox()
     return RedirectResponse("/admin", status_code=303)
+
+
+@app.post("/admin/oi-event", dependencies=[Depends(admin)])
+async def simulate_oi_event(request: Request):
+    form = await request.form()
+    event = form.get("event", "")
+    data = {k: form.get(k) for k in ("booking_id", "guest_name", "guest_phone", "villa_id", "check_in",
+                                     "check_out", "language")}
+    try:
+        booking = scheduler.on_booking_event(event, data)
+    except (LookupError, ValueError) as e:
+        return _back("/admin", "", f"OI event not applied: {e}")
+    await scheduler.run_once()
+    return _back("/admin", "", f"OI '{event}' event applied to {booking['booking_id']}")
 
 
 @app.post("/admin/simulate", dependencies=[Depends(admin)])
@@ -257,6 +423,129 @@ async def simulate(phone: str = Form(...), text: str = Form(...)):
 async def reset(phone: str):
     store.reset_history(phone)
     return RedirectResponse("/admin", status_code=303)
+
+
+# ---------------- Villas & staff: caretakers, managers and per-villa UC-OPS-01 settings ----------------
+
+VILLA_SEARCH_FIELDS = ("villa_id", "name", "location", "area", "residency", "group")
+
+
+@app.get("/admin/villas", response_class=HTMLResponse, dependencies=[Depends(admin)])
+async def villas_page(request: Request, q: str = "", area: str = "", residency: str = "", group: str = "",
+                      msg: str = ""):
+    villas = store.all_villas()
+    filters = {"area": area, "residency": residency, "group": group}
+
+    def select(key: str) -> str:
+        values = sorted({v.get(key) for v in villas if v.get(key)})
+        opts = "".join(f"<option{' selected' if val == filters[key] else ''}>{_e(val)}</option>" for val in values)
+        return f"<label>{key} <select name={key}><option value=''>All</option>{opts}</select></label>"
+
+    shown = [v for v in villas
+             if all(not want or v.get(key) == want for key, want in filters.items())
+             and (not q or q.lower() in " ".join(str(v.get(k) or "") for k in VILLA_SEARCH_FIELDS).lower())]
+
+    def staff_cell(person: dict | None) -> str:
+        return f"{_e(person['name'])} <span class=muted>{_e(person['phone'])}</span>" if person else \
+            "<span class=muted>not assigned</span>"
+
+    def settings_cell(villa_id: str) -> str:
+        s = scheduler.settings(villa_id)
+        return _e(f"{'on' if s['enabled'] else 'OFF'} · T-{s['t7_days']} / T-{s['t1_days']} · "
+                  f"{s['window_start']}–{s['window_end']} · reminder "
+                  f"{str(s['reminder_hours']) + 'h' if s['reminder_enabled'] else 'off'} · no-reply flag "
+                  f"{'on' if s['flag_no_reply'] else 'off'}")
+
+    rows = ""
+    for v in shown:
+        staff = store.staff_for_villa(v["villa_id"])
+        rows += (f"<tr><td><input type=checkbox name=villa_ids value={_e(v['villa_id'])}></td>"
+                 f"<td>{_e(v['name'])}<br><span class=muted>{_e(v['villa_id'])}</span></td>"
+                 f"<td>{_e(v.get('area'))}</td><td>{_e(v.get('residency'))}</td><td>{_e(v.get('group'))}</td>"
+                 f"<td>{staff_cell(staff.get('caretaker'))}</td><td>{staff_cell(staff.get('manager'))}</td>"
+                 f"<td>{settings_cell(v['villa_id'])}</td></tr>")
+    staff_list = store.all_staff()
+    staff_options = "".join(f"<option value={p['id']}>{_e(p['name'])}</option>" for p in staff_list)
+    back = _e(urlencode({k: v for k, v in request.query_params.items() if k != "msg"}))
+    d = scheduler.DEFAULTS
+    on_off = lambda name: (f"<select name={name}><option value=''>keep</option>"  # noqa: E731
+                           "<option value=on>on</option><option value=off>off</option></select>")
+
+    body = (
+        "<h2>Find villas</h2><form method=get action=/admin/villas>"
+        f"<input name=q value='{_e(q)}' placeholder='Search name, area, residency, group' size=32> "
+        f"{select('area')}{select('residency')}{select('group')}<button>Filter</button> "
+        "<a href=/admin/villas>Clear</a></form>"
+        f"<form method=post id=bulk><input type=hidden name=back value='{back}'>"
+        "<table><tr><th><input type=checkbox title='Select all' onclick=\"document.querySelectorAll("
+        "'input[name=villa_ids]').forEach(c => c.checked = this.checked)\"></th><th>Villa</th><th>Area</th>"
+        "<th>Residency</th><th>Group</th><th>Caretaker</th><th>Manager</th><th>UC-OPS-01</th></tr>"
+        + (rows or "<tr><td colspan=8 class=muted>No villas match.</td></tr>") + "</table>"
+        "<fieldset><legend>Assign to the selected villas</legend>"
+        "<select name=role><option value=caretaker>Caretaker</option><option value=manager>Manager</option></select> "
+        f"<select name=staff_id>{staff_options}<option value=''>(remove)</option></select> "
+        "<button formaction=/admin/villas/assign>Assign</button>"
+        + ("" if staff_list else " <span class=muted>Add people under Staff below first.</span>")
+        + "</fieldset>"
+        "<fieldset><legend>UC-OPS-01 settings for the selected villas (blank or 'keep' leaves a value as it is)</legend>"
+        f"<label>Use case {on_off('enabled')}</label>"
+        f"<label>T-<input type=number name=t7_days min=2 max=30 placeholder={d['t7_days']}> pre-arrival days</label>"
+        f"<label>T-<input type=number name=t1_days min=1 max=3 placeholder={d['t1_days']}> arrival days</label>"
+        f"<label>Send between <input type=time name=window_start> and <input type=time name=window_end> IST</label>"
+        f"<label>Reminder {on_off('reminder_enabled')} after "
+        f"<input type=number name=reminder_hours min=1 max=72 placeholder={d['reminder_hours']}> h without a reply</label>"
+        f"<label>Flag no reply by T-1 to the caretaker, manager and control tower {on_off('flag_no_reply')}</label>"
+        "<br><button formaction=/admin/villas/uc-ops-01>Apply to selected</button>"
+        "</fieldset></form>"
+        "<h2>Staff</h2><p class=muted>Caretakers and managers get the ticket email in copy and a WhatsApp alert "
+        "(template gia_staff_alert). The caretaker's number is the contact Gia gives guests at T-1.</p>"
+        + _table(staff_list, ["name", "phone", "email"])
+        + "<form method=post action=/admin/staff><input name=name placeholder='Name' required> "
+          "<input name=phone placeholder='9198XXXXXXXX' size=13> <input name=email type=email placeholder='Email'> "
+          "<button>Add person</button></form>"
+    )
+    return _page(body, msg)
+
+
+@app.post("/admin/villas/assign", dependencies=[Depends(admin)])
+async def assign_staff(request: Request):
+    form = await request.form()
+    villa_ids, role, staff_id = form.getlist("villa_ids"), form.get("role"), form.get("staff_id") or ""
+    back = form.get("back", "")
+    if not villa_ids:
+        return _back("/admin/villas", back, "Select at least one villa.")
+    if role not in store.STAFF_ROLES:
+        raise HTTPException(400, "Unknown role")
+    store.assign_staff(villa_ids, role, int(staff_id) if staff_id else None)
+    store.audit(None, "villa_staff_assigned", "tier0", {"villas": villa_ids, "role": role, "staff_id": staff_id})
+    who = next((p["name"] for p in store.all_staff() if str(p["id"]) == staff_id), None)
+    return _back("/admin/villas", back,
+                 f"{who} is now {role} for {len(villa_ids)} villa(s)." if who else
+                 f"Removed the {role} from {len(villa_ids)} villa(s).")
+
+
+@app.post("/admin/villas/uc-ops-01", dependencies=[Depends(admin)])
+async def save_villa_settings(request: Request):
+    form = await request.form()
+    villa_ids, back = form.getlist("villa_ids"), form.get("back", "")
+    if not villa_ids:
+        return _back("/admin/villas", back, "Select at least one villa.")
+    try:
+        changes = scheduler.parse_settings({k: form.get(k) for k in scheduler.DEFAULTS})
+        if not changes:
+            return _back("/admin/villas", back, "Nothing to change: fill in at least one setting.")
+        scheduler.apply_settings(villa_ids, changes)
+    except ValueError as e:
+        return _back("/admin/villas", back, f"Not saved: {e}")
+    store.audit(None, "uc_ops_01_settings", "tier0", {"villas": villa_ids, "changes": changes})
+    return _back("/admin/villas", back, f"UC-OPS-01 settings saved for {len(villa_ids)} villa(s).")
+
+
+@app.post("/admin/staff", dependencies=[Depends(admin)])
+async def add_staff(name: str = Form(...), phone: str = Form(""), email: str = Form("")):
+    phone = "".join(ch for ch in phone if ch.isdigit())
+    store.add_staff(name.strip(), phone, email.strip())
+    return _back("/admin/villas", "", f"Added {name.strip()}.")
 
 
 @app.get("/")
