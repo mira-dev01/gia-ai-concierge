@@ -10,7 +10,7 @@ import tempfile
 from datetime import datetime
 
 tmp = tempfile.mkdtemp()
-os.environ.update(DB_PATH=f"{tmp}/t.db", DRY_RUN="true", ADMIN_PASSWORD="pw", OI_WEBHOOK_SECRET="s3",
+os.environ.update(DATABASE_URL=os.environ.get("TEST_DATABASE_URL", ""), DB_PATH=f"{tmp}/t.db", DRY_RUN="true", ADMIN_PASSWORD="pw", OI_WEBHOOK_SECRET="s3",
                   GROQ_API_KEY=os.environ.get("GROQ_API_KEY") or "dummy", DEMO_BOOKING_ID="",
                   TICKET_EMAIL_TO="hello@hostwithmira.com", RESEND_API_KEY="")
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))

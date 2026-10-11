@@ -84,7 +84,7 @@ scripts/chat.py   Terminal chat for testing without WhatsApp
 
 - Model: `llama-3.3-70b-versatile` on Groq for fast WhatsApp replies (`GIA_MODEL` in `.env`).
 - WhatsApp only allows free-form messages within 24 hours of the guest's last message. UC-OPS-01 uses templates outside that window; ticket status updates (UC-OPS-05) still need their own template.
-- On Railway, put `DB_PATH` on a volume (for example `/data/gia.db`); otherwise every redeploy starts a fresh database and the sample bookings get their welcome again.
+- Database: set `DATABASE_URL` to a Postgres connection string (for example Neon's pooled one) and the app uses Postgres, creating its tables on first start. Without it, it uses a SQLite file at `DB_PATH` (default `gia.db`), which on Railway needs a volume (for example `DB_PATH=/data/gia.db`) or every redeploy starts empty. The checks always use a throwaway database; set `TEST_DATABASE_URL` to run them against an empty Postgres database instead.
 - On Railway, set the health check path to `/health` (`/` is the password-protected console). The console is served by the backend itself at the Railway URL.
 - To serve the console from Vercel instead, make a Vercel project with root directory `app/static/ops` (framework preset Other, no build command), and set the Railway URL in `app/static/ops/vercel.json`: Vercel forwards `/api/*` to Railway, so the browser sees one site and the same password applies.
 - Not built yet: photo evidence and vision checks, SLA breach escalation, trip scoring, voice notes.

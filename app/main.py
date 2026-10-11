@@ -28,6 +28,11 @@ _background: set[asyncio.Task] = set()  # keeps fire-and-forget tasks referenced
 SCHEDULE_INTERVAL_SECONDS = 60  # how often to send due UC-OPS-01 steps and pending ticket emails
 
 
+@app.on_event("shutdown")
+def _close_database() -> None:
+    store.close()
+
+
 @app.on_event("startup")
 async def _start_scheduler() -> None:
     async def loop():
@@ -600,7 +605,7 @@ async def ops_console_old_address():
 
 
 @app.get(f"{API}/state", dependencies=[Depends(admin)])
-async def ops_state():
+def ops_state():  # sync on purpose: FastAPI runs it in a worker thread, so its many queries don't block the loop
     return ops_view.snapshot(["open", *STATUS_MESSAGES])
 
 

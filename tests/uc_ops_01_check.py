@@ -11,7 +11,7 @@ import tempfile
 from datetime import datetime
 
 tmp = tempfile.mkdtemp()
-os.environ.update(DB_PATH=f"{tmp}/t.db", DRY_RUN="true", ADMIN_PASSWORD="pw", OI_WEBHOOK_SECRET="s3",
+os.environ.update(DATABASE_URL=os.environ.get("TEST_DATABASE_URL", ""), DB_PATH=f"{tmp}/t.db", DRY_RUN="true", ADMIN_PASSWORD="pw", OI_WEBHOOK_SECRET="s3",
                   GROQ_API_KEY=os.environ.get("GROQ_API_KEY") or "dummy", DEMO_BOOKING_ID="", TICKET_EMAIL_TO="hello@hostwithmira.com", RESEND_API_KEY="")
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
@@ -223,12 +223,10 @@ async def main():
     agent.initiate = fake_initiate
 
     # legacy concierge_schedule rows count as sent
-    import sqlite3
-    con = sqlite3.connect(os.environ["DB_PATH"])
-    con.execute("CREATE TABLE concierge_schedule (booking_id TEXT PRIMARY KEY, welcome_at TEXT, t7_at TEXT, "
-                "t7_reminder_at TEXT, t1_at TEXT, t1_host_flag_at TEXT)")
-    con.execute("INSERT INTO concierge_schedule VALUES ('LH-30007', '2026-10-20T10:00:00+05:30', NULL, NULL, NULL, NULL)")
-    con.commit(); con.close()
+    with store._db() as con:  # the app's own connection, so this works on SQLite and Postgres
+        con.execute("CREATE TABLE concierge_schedule (booking_id TEXT PRIMARY KEY, welcome_at TEXT, t7_at TEXT, "
+                    "t7_reminder_at TEXT, t1_at TEXT, t1_host_flag_at TEXT)")
+        con.execute("INSERT INTO concierge_schedule VALUES ('LH-30007', '2026-10-20T10:00:00+05:30', NULL, NULL, NULL, NULL)")
     n = len(sent)
     scheduler.on_booking_event("confirmed", {"booking_id": "LH-30007", "guest_name": "Old Guest", "guest_phone": "919800000015",
                                              "villa_id": "GOA-ASG-01", "check_in": "2026-11-20", "check_out": "2026-11-22",

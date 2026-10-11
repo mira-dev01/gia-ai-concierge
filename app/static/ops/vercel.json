@@ -1,7 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
-    { "source": "/api/:path*", "destination": "https://gia-ai-concierge-production.up.railway.app/" },
+    { "source": "/api/:path*", "destination": "https://gia-ai-concierge-production.up.railway.app/api/:path*" },
     { "source": "/ops/:path*", "destination": "/:path*" }
   ]
 }

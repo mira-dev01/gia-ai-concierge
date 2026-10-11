@@ -1,8 +1,13 @@
-"""SQLite stand-in for OI: bookings, villa capabilities and staff, tickets, preferences, conversations,
-the UC-OPS-01 journey, the ticket email outbox and the audit log."""
+"""Stand-in for OI: bookings, villa capabilities and staff, tickets, preferences, conversations, the UC-OPS-01
+journey, the ticket email outbox and the audit log.
 
+Stored in Postgres when DATABASE_URL is set (Neon in production), otherwise in a local SQLite file at DB_PATH.
+The SQL is written once with ? placeholders and works on both."""
+
+import atexit
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from . import config
@@ -20,15 +25,66 @@ def now() -> datetime:
     return datetime.now(IST).replace(microsecond=0)
 
 
-def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(config.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+class _Conn:
+    """One transaction on either database: execute() takes ? placeholders, insert() returns the new row's id."""
+
+    def __init__(self, raw, postgres: bool):
+        self.raw, self.postgres = raw, postgres
+
+    def execute(self, sql: str, params=()):
+        return self.raw.execute(sql.replace("?", "%s") if self.postgres else sql, params)
+
+    def insert(self, sql: str, params=()) -> int:
+        if self.postgres:
+            return self.execute(sql + " RETURNING id", params).fetchone()["id"]
+        return self.execute(sql, params).lastrowid
+
+
+_pool = None
+
+
+def _postgres_pool():
+    global _pool
+    if _pool is None:
+        from psycopg.rows import dict_row
+        from psycopg_pool import ConnectionPool
+        # prepare_threshold=None: Neon's pooled endpoint (PgBouncer, transaction mode) can't keep prepared
+        # statements. check: Neon suspends idle computes, so test each connection before handing it out.
+        _pool = ConnectionPool(config.DATABASE_URL, min_size=1, max_size=10, open=True,
+                               kwargs={"row_factory": dict_row, "prepare_threshold": None},
+                               check=ConnectionPool.check_connection)
+        atexit.register(close)
+    return _pool
+
+
+def close() -> None:
+    """Close the Postgres pool (at shutdown), so its worker threads stop cleanly."""
+    global _pool
+    if _pool is not None:
+        _pool.close()
+        _pool = None
+
+
+@contextmanager
+def _db():
+    """A transaction: committed when the block ends, rolled back if it raises."""
+    if config.DATABASE_URL:
+        with _postgres_pool().connection() as raw:
+            yield _Conn(raw, postgres=True)
+        return
+    config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    raw = sqlite3.connect(config.DB_PATH)
+    raw.row_factory = sqlite3.Row
+    try:
+        with raw:
+            yield _Conn(raw, postgres=False)
+    finally:
+        raw.close()
 
 
 def init() -> None:
     with _db() as c:
-        c.executescript(
+        schema = (
             """
             CREATE TABLE IF NOT EXISTS bookings (
                 booking_id TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT);
@@ -78,6 +134,10 @@ def init() -> None:
                 direction TEXT NOT NULL, body TEXT, at TEXT);
             """
         )
+        if c.postgres:
+            c.raw.execute(schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY"))
+        else:
+            c.raw.executescript(schema)
         # Columns added after the first release, for databases created before them.
         _add_column(c, "tickets", "source", "TEXT")  # UC-OPS-01
         _add_column(c, "tickets", "operator_id", "INTEGER")  # ops console: the field operator who owns it
@@ -98,9 +158,17 @@ def init() -> None:
                       (b["booking_id"], json.dumps(merged, ensure_ascii=False), now().isoformat()))
 
 
-def _add_column(c: sqlite3.Connection, table: str, column: str, kind: str) -> None:
-    if column not in {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}:
+def _add_column(c: _Conn, table: str, column: str, kind: str) -> None:
+    if c.postgres:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {kind}")
+    elif column not in {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}:
         c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+
+
+def _table_exists(c: _Conn, table: str) -> bool:
+    if c.postgres:
+        return c.execute("SELECT to_regclass(?) IS NOT NULL AS ok", (table,)).fetchone()["ok"]
+    return c.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone() is not None
 
 
 # ---- bookings (written by OI booking events) and villas (read-only) ----
@@ -157,11 +225,7 @@ def all_villas() -> list[dict]:
 
 def first_time_seen(message_id: str) -> bool:
     with _db() as c:
-        try:
-            c.execute("INSERT INTO seen_messages (id) VALUES (?)", (message_id,))
-            return True
-        except sqlite3.IntegrityError:
-            return False
+        return c.execute("INSERT INTO seen_messages (id) VALUES (?) ON CONFLICT (id) DO NOTHING", (message_id,)).rowcount == 1
 
 
 # ---- conversation state (Groq message history, append-only) ----
@@ -234,7 +298,7 @@ def create_ticket(booking: dict, phone: str, category: str, severity: str, summa
     created = now()
     due = created + timedelta(minutes=SLA_MINUTES.get(severity, 180))
     with _db() as c:
-        cur = c.execute(
+        ticket_id = c.insert(
             "INSERT INTO tickets (booking_id, villa_id, phone, category, severity, summary, details, status, "
             "assignee, created_at, due_at, updated_at, source, operator_id) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)",
@@ -242,7 +306,6 @@ def create_ticket(booking: dict, phone: str, category: str, severity: str, summa
              assignee or ASSIGNEE_BY_CATEGORY.get(category, "Ops agent"), created.isoformat(), due.isoformat(),
              created.isoformat(), source, operator_id),
         )
-        ticket_id = cur.lastrowid
     return get_ticket(ticket_id)
 
 
@@ -296,7 +359,7 @@ def ticket_by_ref(ref: str) -> dict | None:
     return get_ticket(int(digits)) if digits else None
 
 
-def _ticket_view(row: sqlite3.Row) -> dict:
+def _ticket_view(row) -> dict:
     t = dict(row)
     t["ref"] = f"OI-{t['id']:05d}"
     return t
@@ -342,11 +405,10 @@ def guest_details(booking_id: str) -> dict:
 
 def create_handoff(booking_id: str | None, phone: str, reason: str, urgency: str) -> int:
     with _db() as c:
-        cur = c.execute(
+        return c.insert(
             "INSERT INTO handoffs (booking_id, phone, reason, urgency, status, at) VALUES (?, ?, ?, ?, 'waiting', ?)",
             (booking_id, phone, reason, urgency, now().isoformat()),
         )
-        return cur.lastrowid
 
 
 def all_handoffs() -> list[dict]:
@@ -449,8 +511,8 @@ def add_step(booking_id: str, step: str, due_at: str, status: str = "scheduled",
     """Create a step unless the booking already has it."""
     with _db() as c:
         c.execute(
-            "INSERT OR IGNORE INTO journey_steps (booking_id, step, due_at, status, note, sent_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO journey_steps (booking_id, step, due_at, status, note, sent_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (booking_id, step) DO NOTHING",
             (booking_id, step, due_at, status, note, sent_at, now().isoformat()),
         )
 
@@ -464,10 +526,9 @@ def delete_steps(booking_id: str, status: str) -> None:
 def legacy_schedule(booking_id: str) -> dict:
     """What the pre-upgrade concierge_schedule table recorded as sent, so an existing database isn't re-sent."""
     with _db() as c:
-        try:
-            row = c.execute("SELECT * FROM concierge_schedule WHERE booking_id = ?", (booking_id,)).fetchone()
-        except sqlite3.OperationalError:
+        if not _table_exists(c, "concierge_schedule"):
             return {}  # a database created after the upgrade has no such table
+        row = c.execute("SELECT * FROM concierge_schedule WHERE booking_id = ?", (booking_id,)).fetchone()
     return dict(row) if row else {}
 
 
@@ -495,12 +556,11 @@ def scheduled_steps() -> list[dict]:
 def claim_step(step_id: int) -> bool:
     """Mark a scheduled step as sent before sending it, so two runs can never both send it."""
     with _db() as c:
-        cur = c.execute(
+        return c.execute(
             "UPDATE journey_steps SET status = 'sent', sent_at = ?, attempts = attempts + 1, updated_at = ? "
             "WHERE id = ? AND status = 'scheduled'",
             (now().isoformat(), now().isoformat(), step_id),
-        )
-    return cur.rowcount == 1
+        ).rowcount == 1
 
 
 def update_step(step_id: int, **fields) -> None:
@@ -549,9 +609,8 @@ PRESENCE = ("onsite", "offsite")
 
 def add_staff(name: str, phone: str, email: str, presence: str = "onsite") -> int:
     with _db() as c:
-        cur = c.execute("INSERT INTO staff (name, phone, email, created_at, presence) VALUES (?, ?, ?, ?, ?)",
+        return c.insert("INSERT INTO staff (name, phone, email, created_at, presence) VALUES (?, ?, ?, ?, ?)",
                         (name, phone, email, now().isoformat(), presence))
-        return cur.lastrowid
 
 
 def get_staff(staff_id: int | None) -> dict | None:
@@ -651,12 +710,11 @@ def on_ground_contact(villa_id: str) -> dict:
 
 def enqueue_email(kind: str, ref: str, to: str, cc: list[str], subject: str, body: str) -> int:
     with _db() as c:
-        cur = c.execute(
+        return c.insert(
             "INSERT INTO outbox_emails (kind, ref, to_addr, cc, subject, body, status, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
             (kind, ref, to, json.dumps(cc), subject, body, now().isoformat()),
         )
-        return cur.lastrowid
 
 
 def pending_emails() -> list[dict]:
