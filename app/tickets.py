@@ -8,21 +8,37 @@ is lost.
 import asyncio
 import logging
 
-from . import config, mailer, store, wa_templates, whatsapp
+from . import config, mailer, operators, store, wa_templates, whatsapp
 
 log = logging.getLogger("gia.tickets")
 
 MAX_EMAIL_ATTEMPTS = 5
+
+# What the guest is told when ops (or the field operator) moves their request on (UC-OPS-05 step 5).
+STATUS_MESSAGES = {
+    "acknowledged": "The team has picked up your request {ref} ({summary}). Expected by {due}.",
+    "in_progress": "Your request {ref} ({summary}) is in progress now.",
+    "delayed": "Sorry, your request {ref} ({summary}) is running late. We've escalated it and will update you shortly.",
+    "closed": "Your request {ref} ({summary}) is done. Is everything as you wanted? Just reply here if not.",
+}
 _flush_lock = asyncio.Lock()
 _background: set[asyncio.Task] = set()  # keeps fire-and-forget flushes referenced until they finish
 
 
 def raise_ticket(booking: dict, phone: str, category: str, severity: str, summary: str, details: str,
                  source: str = "guest", assignee: str | None = None) -> dict:
-    """Create a ticket and email it to the ops inbox, copying the villa's caretaker and manager."""
-    t = store.create_ticket(booking, phone, category, severity, summary, details, source=source, assignee=assignee)
+    """Create a ticket, give it to the villa's field operator for that kind of work (an onsite one first),
+    tell the operator on WhatsApp, and email it to the ops inbox, copying the villa's caretaker and manager."""
+    op = operators.pick(booking["villa_id"], category)
+    if op and assignee is None:
+        assignee = operators.label(op)
+    t = store.create_ticket(booking, phone, category, severity, summary, details, source=source, assignee=assignee,
+                            operator_id=op["id"] if op else None)
     store.audit(booking["booking_id"], "ticket_raised", "tier0",
-                {"ticket": t["ref"], "source": source, "category": category, "severity": severity})
+                {"ticket": t["ref"], "source": source, "category": category, "severity": severity,
+                 "operator": op["name"] if op else None})
+    if op and source == "guest":  # internal flags already alert the villa team themselves (alert_staff)
+        _spawn(lambda: operators.notify_assignment(t, booking))
     staff = store.staff_for_villa(booking["villa_id"])
     body = (f"Ticket {t['ref']} (mock OI)\n"
             f"Category: {category}    Severity: {severity}    Status: {t['status']}\n"
@@ -36,9 +52,28 @@ def raise_ticket(booking: dict, phone: str, category: str, severity: str, summar
     return t
 
 
+async def set_status(ticket_id: int, status: str, by: str = "ops") -> dict:
+    """Move a ticket on. For a guest's own request, Gia tells the guest on WhatsApp (UC-OPS-05 step 5).
+    Closing records the time to resolve; `by` says who closed it (ops, or the operator and how)."""
+    if status not in STATUS_MESSAGES:
+        raise ValueError("Unknown status")
+    t = store.set_ticket_status(ticket_id, status, by=by)
+    if not t:
+        raise LookupError("No such ticket")
+    store.audit(t["booking_id"], f"ticket_status:{status}", "tier0", {"ticket": t["ref"], "by": by})
+    if t["source"] in (None, "guest"):  # internal tickets (no-reply flags, delivery failures) aren't the guest's
+        msg = STATUS_MESSAGES[status].format(ref=t["ref"], summary=t["summary"], due=t["due_at"][11:16] + " IST")
+        store.log_message(t["phone"], t["booking_id"], "out", msg)
+        store.add_note(t["phone"], f"ticket {t['ref']} was set to '{status}' by {by} and Gia sent the guest: \"{msg}\"")
+        await whatsapp.send_text(t["phone"], msg)
+    return t
+
+
 def raise_handoff(booking: dict | None, phone: str, reason: str, urgency: str) -> int:
     """Hand the guest to the ops control tower and email the handoff with the conversation so far."""
     handoff_id = store.create_handoff(booking["booking_id"] if booking else None, phone, reason, urgency)
+    store.audit(booking["booking_id"] if booking else None, "handoff_raised", "tier0",
+                {"handoff": handoff_id, "reason": reason, "urgency": urgency, "phone": phone})
     staff = store.staff_for_villa(booking["villa_id"]) if booking else {}
     who = booking["guest_name"] if booking else phone
     body = (f"Handoff HO-{handoff_id} to the control tower ({urgency})\n\nReason: {reason}\n\n"
@@ -68,9 +103,11 @@ async def alert_staff(booking: dict, ticket: dict, what_happened: str) -> list[s
         values = [what_happened, villa.get("name", booking["villa_id"]), booking["guest_name"],
                   booking["booking_id"], booking["check_in"], ticket["ref"]]
         try:
-            result, _, sent_as = await wa_templates.send(person["phone"], wa_templates.STAFF_ALERT, values)
+            result, text, sent_as = await wa_templates.send(person["phone"], wa_templates.STAFF_ALERT, values)
             whatsapp.message_id(result)
             messaged.append(f"{person['name']} ({role})")
+            if person.get("id"):  # the villa host on record isn't an operator
+                store.log_operator_message(person["id"], ticket["ref"], "out", text)
             store.audit(booking["booking_id"], "staff_alert", "tier0",
                         {"ticket": ticket["ref"], "to": person["name"], "role": role, "template": sent_as})
         except Exception as e:  # the ticket email still reaches ops; record the miss
@@ -98,10 +135,16 @@ async def flush_outbox() -> None:
 
 
 def _kick() -> None:
+    _spawn(flush_outbox)  # without an event loop, the background loop sends it
+
+
+def _spawn(make) -> None:
+    """Run make() as a background task when there's an event loop (raise_ticket is called from sync code)."""
     try:
-        task = asyncio.get_running_loop().create_task(flush_outbox())
+        loop = asyncio.get_running_loop()
     except RuntimeError:
-        return  # no event loop here; the background loop sends it
+        return
+    task = loop.create_task(make())
     _background.add(task)
     task.add_done_callback(_background.discard)
 
@@ -123,6 +166,7 @@ def _context(booking: dict | None, phone: str) -> str:
     convo = store.transcript_for(phone)
     if convo:
         lines.append("\nRecent conversation:")
-        lines += [f"{m['at'][5:16].replace('T', ' ')} {'guest' if m['direction'] == 'in' else 'Gia'}: {m['body']}"
+        lines += [f"{m['at'][5:16].replace('T', ' ')} {({'in': 'guest', 'ops': 'ops team'}).get(m['direction'], 'Gia')}: "
+                  f"{m['body']}"
                   for m in convo]
     return "\n".join(lines)

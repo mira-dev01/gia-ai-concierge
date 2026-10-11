@@ -23,14 +23,14 @@
       "guest_name": "Abhaya Trivedi",
       "guest_phone": "918130026321",
       "language": "hi",
-      "check_in": "2026-10-07",
-      "check_out": "2026-10-10",
+      "check_in": "2026-10-12",
+      "check_out": "2026-10-14",
       "adults": 4,
       "children": 2,
       "pets": 0,
       "occasion": null,
       "vip": false,
-      "status": "in_stay",
+      "status": "Pre-Arrival",
       "pre_booked_services": ["Breakfast (included)", "Jetty pick-up on arrival"]
     },
     {

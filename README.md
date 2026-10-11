@@ -41,6 +41,14 @@ uvicorn app.main:app --port 8000
 
 Open http://localhost:8000/admin (any username, password = `ADMIN_PASSWORD`). The console shows handoffs, tickets with status buttons, the live conversation, captured preferences, arrival details and the audit log. "Try Gia without WhatsApp" lets you chat from the browser too.
 
+**http://localhost:8000/** is the **ops console** (same password; `/health` is the unauthenticated health check). Overview, Guest Journeys and Operations run on live data, refreshed every 5 seconds:
+
+- **Overview**: counts, **Live activity** (who Gia is talking to right now, tickets raised, guests asking for a person, issues resolved and how long they took, operator messages), Needs a person, active stays and operators. Important events also pop up briefly on any screen. Takeovers and ops replies are left out on purpose.
+- **Guest Journeys**: each guest's WhatsApp chat (takeovers and hand-backs are noted in the chat), profile, tickets and activity. **Take over** pauses Gia and holds scheduled UC-OPS-01 messages; ops replies go out on WhatsApp; on hand-back Gia is told what happened.
+- **Operations**: tickets grouped by **field operator** (busiest first), each flagged with how long it has been open or how long it took to resolve (red past its SLA). **+ Add operator** (top right) adds an operator with their WhatsApp number, role (caretaker, maintenance, housekeeping, manager), villas and whether they're onsite or offsite. New tickets go to the villa's operator for that kind of work, onsite first, and Gia sends them the task on WhatsApp. The phone shows the operator's WhatsApp thread live: ops can message them, switch them onsite/offsite and tap **Mark done** as the field app would. Operators can reply **DONE** (or **DONE OI-00012** with several open), **ONSITE** or **OFFSITE**; anything else shows up for ops. Closing a ticket any way records the time to resolve and tells the guest. Tickets can be reassigned from the ticket.
+
+Items tagged **Demo** are two scripted scenarios kept for walkthroughs (an anniversary request, and a basin leak whose repair photos are checked before the ticket closes); photo evidence and the Workflow explorer exist only there for now. "Reset demo scenarios" restarts them without touching live data. An operator's number that is also a guest's booking number is treated as the guest.
+
 **3. Connect it to your Meta app:** follow [SETUP_META.md](SETUP_META.md).
 
 ## Demo script (about 5 minutes)
@@ -66,6 +74,9 @@ app/agent.py      Gia: system prompt, tools, Claude tool-use loop
 app/whatsapp.py   WhatsApp Cloud API client and webhook signature check
 app/store.py      SQLite stand-in for OI (tickets, preferences, handoffs, audit)
 app/data/         Sample villas (capability database) and bookings
+app/ops_view.py   Live data for the ops console (one snapshot the console polls)
+app/operators.py  Field operators: routing tickets, telling them on WhatsApp, their DONE / ONSITE / OFFSITE replies
+app/static/ops/   Ops console (React + htm from a CDN, no build step); live.js talks to the API, data.js holds the demo scenarios
 scripts/chat.py   Terminal chat for testing without WhatsApp
 ```
 
@@ -74,6 +85,8 @@ scripts/chat.py   Terminal chat for testing without WhatsApp
 - Model: `llama-3.3-70b-versatile` on Groq for fast WhatsApp replies (`GIA_MODEL` in `.env`).
 - WhatsApp only allows free-form messages within 24 hours of the guest's last message. UC-OPS-01 uses templates outside that window; ticket status updates (UC-OPS-05) still need their own template.
 - On Railway, put `DB_PATH` on a volume (for example `/data/gia.db`); otherwise every redeploy starts a fresh database and the sample bookings get their welcome again.
+- On Railway, set the health check path to `/health` (`/` is the password-protected console). The console is served by the backend itself at the Railway URL.
+- To serve the console from Vercel instead, make a Vercel project with root directory `app/static/ops` (framework preset Other, no build command), and set the Railway URL in `app/static/ops/vercel.json`: Vercel forwards `/api/*` to Railway, so the browser sees one site and the same password applies.
 - Not built yet: photo evidence and vision checks, SLA breach escalation, trip scoring, voice notes.
 
 ## UC-OPS-01 Initiate concierge chat
@@ -90,6 +103,6 @@ scripts/chat.py   Terminal chat for testing without WhatsApp
 
 **Mock OI tickets.** `app/tickets.py` saves every ticket and handoff and emails it, with the booking and the recent conversation, to `TICKET_EMAIL_TO` (one address, or several separated by commas) through [Resend](https://resend.com). Set `RESEND_API_KEY` and `RESEND_FROM` (an address on a domain verified in Resend) in `.env`; without a key, emails are logged in the console instead of sent. Emails go through an outbox, so a failed send is retried. Replace `raise_ticket` and `raise_handoff` with OI's endpoint when it's ready.
 
-**Automated check.** `python -m tests.uc_ops_01_check` runs every UC-OPS-01 rule against a frozen clock and a throwaway database, with WhatsApp faked and Resend mocked, so nothing is sent.
+**Automated check.** `python -m tests.uc_ops_01_check` runs every UC-OPS-01 rule against a frozen clock and a throwaway database, with WhatsApp faked and Resend mocked, so nothing is sent. `python -m tests.ops_console_check` does the same for the ops console's API: ticket status changes, takeover and hand-back, ops replies (including outside WhatsApp's 24-hour window), handoff resolution, and field operators (routing, onsite first, WhatsApp commands, field-app done, time to resolve, reassignment).
 
 **Templates to submit to Meta** (category Utility, English): `gia_welcome`, `gia_welcome_pre_arrival`, `gia_pre_arrival`, `gia_pre_arrival_reminder`, `gia_arrival_t1`, `gia_staff_alert`, with the exact bodies and buttons in `app/wa_templates.py`. Set `WA_TEMPLATES_LIVE=true` once they're approved; until then `hello_world` goes out and the real text is logged.

@@ -71,10 +71,19 @@ def init() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, ref TEXT, to_addr TEXT, cc TEXT,
                 subject TEXT, body TEXT, status TEXT, attempts INTEGER NOT NULL DEFAULT 0, error TEXT,
                 created_at TEXT, sent_at TEXT);
+            CREATE TABLE IF NOT EXISTS takeovers (
+                phone TEXT PRIMARY KEY, booking_id TEXT, at TEXT);
+            CREATE TABLE IF NOT EXISTS operator_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, staff_id INTEGER NOT NULL, ticket_ref TEXT,
+                direction TEXT NOT NULL, body TEXT, at TEXT);
             """
         )
-        if "source" not in {r["name"] for r in c.execute("PRAGMA table_info(tickets)")}:
-            c.execute("ALTER TABLE tickets ADD COLUMN source TEXT")  # databases created before UC-OPS-01
+        # Columns added after the first release, for databases created before them.
+        _add_column(c, "tickets", "source", "TEXT")  # UC-OPS-01
+        _add_column(c, "tickets", "operator_id", "INTEGER")  # ops console: the field operator who owns it
+        _add_column(c, "tickets", "resolved_at", "TEXT")
+        _add_column(c, "tickets", "resolved_by", "TEXT")
+        _add_column(c, "staff", "presence", "TEXT NOT NULL DEFAULT 'onsite'")
         # Sample bookings count as confirmed the first time the service sees them. An edit to bookings.json
         # is applied on the next start; otherwise changes made by OI events are kept.
         for b in _seed_bookings:
@@ -87,6 +96,11 @@ def init() -> None:
             c.execute("INSERT INTO bookings (booking_id, data, updated_at) VALUES (?, ?, ?) ON CONFLICT(booking_id) "
                       "DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
                       (b["booking_id"], json.dumps(merged, ensure_ascii=False), now().isoformat()))
+
+
+def _add_column(c: sqlite3.Connection, table: str, column: str, kind: str) -> None:
+    if column not in {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
 
 # ---- bookings (written by OI booking events) and villas (read-only) ----
@@ -215,17 +229,18 @@ ASSIGNEE_BY_CATEGORY = {
 
 
 def create_ticket(booking: dict, phone: str, category: str, severity: str, summary: str, details: str,
-                  source: str = "guest", assignee: str | None = None) -> dict:
+                  source: str = "guest", assignee: str | None = None, operator_id: int | None = None) -> dict:
     """source 'guest' is a guest's own request (status changes are messaged to them); anything else is internal."""
     created = now()
     due = created + timedelta(minutes=SLA_MINUTES.get(severity, 180))
     with _db() as c:
         cur = c.execute(
             "INSERT INTO tickets (booking_id, villa_id, phone, category, severity, summary, details, status, "
-            "assignee, created_at, due_at, updated_at, source) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
+            "assignee, created_at, due_at, updated_at, source, operator_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)",
             (booking["booking_id"], booking["villa_id"], phone, category, severity, summary, details,
              assignee or ASSIGNEE_BY_CATEGORY.get(category, "Ops agent"), created.isoformat(), due.isoformat(),
-             created.isoformat(), source),
+             created.isoformat(), source, operator_id),
         )
         ticket_id = cur.lastrowid
     return get_ticket(ticket_id)
@@ -249,11 +264,36 @@ def all_tickets() -> list[dict]:
     return [_ticket_view(r) for r in rows]
 
 
-def set_ticket_status(ticket_id: int, status: str) -> dict | None:
+def set_ticket_status(ticket_id: int, status: str, by: str | None = None) -> dict | None:
+    """Closing records when and by whom (the resolve time is created_at to resolved_at); reopening clears it."""
+    at = now().isoformat()
     with _db() as c:
-        c.execute("UPDATE tickets SET status = ?, updated_at = ? WHERE id = ?",
-                  (status, now().isoformat(), ticket_id))
+        if status == "closed":
+            c.execute("UPDATE tickets SET status = ?, updated_at = ?, resolved_at = COALESCE(resolved_at, ?), "
+                      "resolved_by = COALESCE(resolved_by, ?) WHERE id = ?", (status, at, at, by, ticket_id))
+        else:
+            c.execute("UPDATE tickets SET status = ?, updated_at = ?, resolved_at = NULL, resolved_by = NULL "
+                      "WHERE id = ?", (status, at, ticket_id))
     return get_ticket(ticket_id)
+
+
+def assign_ticket(ticket_id: int, operator_id: int | None, assignee: str) -> dict | None:
+    with _db() as c:
+        c.execute("UPDATE tickets SET operator_id = ?, assignee = ?, updated_at = ? WHERE id = ?",
+                  (operator_id, assignee, now().isoformat(), ticket_id))
+    return get_ticket(ticket_id)
+
+
+def open_tickets_for_operator(staff_id: int) -> list[dict]:
+    with _db() as c:
+        rows = c.execute("SELECT * FROM tickets WHERE operator_id = ? AND status != 'closed' ORDER BY id",
+                         (staff_id,)).fetchall()
+    return [_ticket_view(r) for r in rows]
+
+
+def ticket_by_ref(ref: str) -> dict | None:
+    digits = "".join(ch for ch in ref if ch.isdigit())
+    return get_ticket(int(digits)) if digits else None
 
 
 def _ticket_view(row: sqlite3.Row) -> dict:
@@ -313,6 +353,34 @@ def all_handoffs() -> list[dict]:
     with _db() as c:
         rows = c.execute("SELECT * FROM handoffs ORDER BY id DESC").fetchall()
     return [dict(r) for r in rows]
+
+
+def set_handoff_status(handoff_id: int, status: str) -> dict | None:
+    with _db() as c:
+        c.execute("UPDATE handoffs SET status = ? WHERE id = ?", (status, handoff_id))
+        row = c.execute("SELECT * FROM handoffs WHERE id = ?", (handoff_id,)).fetchone()
+    return dict(row) if row else None
+
+
+# ---- ops takeover: a person is replying to the guest, so Gia stays quiet until they hand back ----
+
+def set_takeover(phone: str, booking_id: str | None, on: bool) -> None:
+    with _db() as c:
+        if on:
+            c.execute("INSERT INTO takeovers (phone, booking_id, at) VALUES (?, ?, ?) ON CONFLICT(phone) DO NOTHING",
+                      (phone, booking_id, now().isoformat()))
+        else:
+            c.execute("DELETE FROM takeovers WHERE phone = ?", (phone,))
+
+
+def takeover_active(phone: str) -> bool:
+    with _db() as c:
+        return c.execute("SELECT 1 FROM takeovers WHERE phone = ?", (phone,)).fetchone() is not None
+
+
+def takeover_phones() -> set[str]:
+    with _db() as c:
+        return {r["phone"] for r in c.execute("SELECT phone FROM takeovers").fetchall()}
 
 
 # ---- notes for Gia about things that happened outside the chat (sent with the guest's next message) ----
@@ -472,16 +540,74 @@ def update_villa_settings(villa_ids: list[str], use_case: str, changes: dict) ->
             )
 
 
-# ---- villa staff: caretakers and managers ----
+# ---- villa staff: caretakers and managers (UC-OPS-01), plus the field operators tickets go to ----
 
 STAFF_ROLES = ("caretaker", "manager")
+OPERATOR_ROLES = ("caretaker", "maintenance", "housekeeping", "manager")
+PRESENCE = ("onsite", "offsite")
 
 
-def add_staff(name: str, phone: str, email: str) -> int:
+def add_staff(name: str, phone: str, email: str, presence: str = "onsite") -> int:
     with _db() as c:
-        cur = c.execute("INSERT INTO staff (name, phone, email, created_at) VALUES (?, ?, ?, ?)",
-                        (name, phone, email, now().isoformat()))
+        cur = c.execute("INSERT INTO staff (name, phone, email, created_at, presence) VALUES (?, ?, ?, ?, ?)",
+                        (name, phone, email, now().isoformat(), presence))
         return cur.lastrowid
+
+
+def get_staff(staff_id: int | None) -> dict | None:
+    if staff_id is None:
+        return None
+    with _db() as c:
+        row = c.execute("SELECT * FROM staff WHERE id = ?", (staff_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def staff_by_phone(phone: str) -> dict | None:
+    with _db() as c:
+        row = c.execute("SELECT * FROM staff WHERE phone = ? ORDER BY id LIMIT 1", (phone,)).fetchone()
+    return dict(row) if row else None
+
+
+def set_presence(staff_id: int, presence: str) -> None:
+    with _db() as c:
+        c.execute("UPDATE staff SET presence = ? WHERE id = ?", (presence, staff_id))
+
+
+def operator_roles() -> dict[int, list[dict]]:
+    """Every operator's villas and roles: {staff_id: [{villa_id, role}]}."""
+    out: dict[int, list[dict]] = {}
+    with _db() as c:
+        for r in c.execute("SELECT staff_id, villa_id, role FROM villa_staff ORDER BY villa_id").fetchall():
+            out.setdefault(r["staff_id"], []).append({"villa_id": r["villa_id"], "role": r["role"]})
+    return out
+
+
+def operators_for_villa(villa_id: str) -> list[dict]:
+    with _db() as c:
+        rows = c.execute("SELECT vs.role, s.id, s.name, s.phone, s.email, s.presence FROM villa_staff vs "
+                         "JOIN staff s ON s.id = vs.staff_id WHERE vs.villa_id = ?", (villa_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def log_operator_message(staff_id: int, ticket_ref: str | None, direction: str, body: str) -> None:
+    """direction: in (from the operator), out (Gia to the operator), ops (a person in ops), note (system)."""
+    with _db() as c:
+        c.execute("INSERT INTO operator_messages (staff_id, ticket_ref, direction, body, at) VALUES (?, ?, ?, ?, ?)",
+                  (staff_id, ticket_ref, direction, body, now().isoformat()))
+
+
+def operator_messages(staff_id: int, limit: int = 100) -> list[dict]:
+    with _db() as c:
+        rows = c.execute("SELECT * FROM operator_messages WHERE staff_id = ? ORDER BY id DESC LIMIT ?",
+                         (staff_id, limit)).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def operator_last_inbound(staff_id: int) -> str | None:
+    with _db() as c:
+        row = c.execute("SELECT MAX(at) AS at FROM operator_messages WHERE staff_id = ? AND direction = 'in'",
+                        (staff_id,)).fetchone()
+    return row["at"]
 
 
 def all_staff() -> list[dict]:
@@ -503,9 +629,11 @@ def assign_staff(villa_ids: list[str], role: str, staff_id: int | None) -> None:
 
 
 def staff_for_villa(villa_id: str) -> dict[str, dict]:
+    """The villa's caretaker and manager (the UC-OPS-01 contacts), not its other operators."""
     with _db() as c:
         rows = c.execute("SELECT vs.role, s.id, s.name, s.phone, s.email FROM villa_staff vs "
-                         "JOIN staff s ON s.id = vs.staff_id WHERE vs.villa_id = ?", (villa_id,)).fetchall()
+                         "JOIN staff s ON s.id = vs.staff_id WHERE vs.villa_id = ? AND vs.role IN (?, ?)",
+                         (villa_id, *STAFF_ROLES)).fetchall()
     return {r["role"]: dict(r) for r in rows}
 
 
