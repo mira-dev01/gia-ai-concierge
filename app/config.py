@@ -40,5 +40,7 @@ RESEND_FROM = _get("RESEND_FROM")        # e.g. "Gia <gia@yourdomain.com>", on a
 # Shared secret OI sends in the X-OI-Secret header on booking events
 OI_WEBHOOK_SECRET = _get("OI_WEBHOOK_SECRET")
 
+# Postgres (e.g. Neon) when set; otherwise a local SQLite file at DB_PATH (local development and the checks).
+DATABASE_URL = _get("DATABASE_URL")
 DB_PATH = Path(_get("DB_PATH", str(ROOT / "gia.db")))
 DATA_DIR = ROOT / "app" / "data"
