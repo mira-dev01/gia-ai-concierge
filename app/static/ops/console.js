@@ -982,12 +982,14 @@ const PresenceChip = ({ presence }) => h`<span className=${'presence ' + presenc
 
 // ---------- guest journeys ----------
 
-function ChatItem(m, i) {
+function ChatItem(m, i, arr) {
+  // Only label the sender on the first bubble of a consecutive run from them, like any chat UI.
+  const sameSenderAsPrev = arr && arr[i - 1] && arr[i - 1].kind === m.kind;
   switch (m.kind) {
     case 'date': return h`<div key=${i} className="chat-date">${m.text}</div>`;
     case 'guest': return h`<div key=${i} className="bubble guest">${m.text}<div className="time">${m.time}</div></div>`;
-    case 'gia': return h`<div key=${i} className="bubble gia"><div className="who">Gia · AI concierge</div>${m.text}<div className="time">${m.time}</div></div>`;
-    case 'ops': return h`<div key=${i} className="bubble ops"><div className="who">Ops team · human</div>${m.text}${m.time && h`<div className="time">${m.time}</div>`}</div>`;
+    case 'gia': return h`<div key=${i} className="bubble gia">${!sameSenderAsPrev && h`<div className="who">Gia · AI concierge</div>`}${m.text}<div className="time">${m.time}</div></div>`;
+    case 'ops': return h`<div key=${i} className="bubble ops">${!sameSenderAsPrev && h`<div className="who">Ops team · human</div>`}${m.text}${m.time && h`<div className="time">${m.time}</div>`}</div>`;
     case 'note': return h`<div key=${i} className="chat-note">${m.text}${m.time && h` · ${m.time}`}</div>`;
     default: return h`<button key=${i} className="chat-chip" onClick=${m.go}><span className="sq"></span>${m.text}<span className="time">${m.time}</span></button>`;
   }
