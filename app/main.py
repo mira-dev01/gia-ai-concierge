@@ -6,13 +6,15 @@ import logging
 import secrets
 from collections import defaultdict
 from datetime import date
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel
 
-from . import agent, config, scheduler, store, tickets, whatsapp
+from . import agent, config, operators, ops_view, scheduler, store, tickets, whatsapp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("gia")
@@ -42,12 +44,7 @@ async def _start_scheduler() -> None:
     task = asyncio.create_task(loop())
     _background.add(task)
 
-STATUS_MESSAGES = {
-    "acknowledged": "The team has picked up your request {ref} ({summary}). Expected by {due}.",
-    "in_progress": "Your request {ref} ({summary}) is in progress now.",
-    "delayed": "Sorry, your request {ref} ({summary}) is running late. We've escalated it and will update you shortly.",
-    "closed": "Your request {ref} ({summary}) is done. Is everything as you wanted? Just reply here if not.",
-}
+STATUS_MESSAGES = tickets.STATUS_MESSAGES
 
 
 # ---------------- Meta webhook ----------------
@@ -104,6 +101,11 @@ async def _handle_incoming(msg: dict) -> None:
         text = f"(The guest sent an unsupported {kind} message.)"
 
     await whatsapp.mark_read(msg["id"])
+    staff = store.staff_by_phone(phone)
+    if staff and not any(b["guest_phone"] == phone for b in store.all_bookings()):  # a guest's own number stays a guest
+        async with _locks[phone]:
+            await operators.handle_message(staff, text)
+        return
     await _converse(phone, text, send=True)
 
 
@@ -112,6 +114,9 @@ async def _converse(phone: str, text: str, send: bool) -> str:
         booking = store.find_booking(phone)
         booking_id = booking["booking_id"] if booking else None
         store.log_message(phone, booking_id, "in", text)
+        if store.takeover_active(phone):  # a person from ops is replying; Gia catches up when they hand back
+            store.add_note(phone, f"while the ops team was handling the chat, the guest wrote: \"{text}\"")
+            return ""
         try:
             answer = await agent.reply(phone, text)
         except Exception:
@@ -142,9 +147,9 @@ async def oi_booking_event(request: Request):
     try:
         booking = scheduler.on_booking_event(payload.get("event", ""), payload.get("booking") or {})
     except LookupError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404, str(e)) from e
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
     task = asyncio.create_task(scheduler.run_once())  # send a due welcome now rather than at the next loop
     _background.add(task)
     task.add_done_callback(_background.discard)
@@ -205,7 +210,7 @@ input[type=number]{{width:4em}}
 .in{{margin:4px 0}} .out{{margin:4px 0 4px 32px;color:var(--accent)}}
 </style></head><body>
 <h1>Gia ops console</h1><div class=muted>Lohono Stays demo · stands in for OI ·
-<a href=/admin>Console</a> · <a href=/admin/villas>Villas &amp; staff</a></div>
+<a href=/admin>Console</a> · <a href=/admin/villas>Villas &amp; staff</a> · <a href=/>Ops console</a></div>
 {msg}{body}</body></html>"""
 
 
@@ -251,7 +256,8 @@ async def booking_page(booking_id: str):
     journey = [{**steps[name], "step": scheduler.STEP_LABELS[name]} for name in scheduler.STEPS if name in steps]
     chat = "".join(
         f"<div class={m['direction']}><span class=muted>{_e(_short(m['at']))} "
-        f"{'guest' if m['direction'] == 'in' else 'Gia'}</span> {_e(m['body'])}</div>" for m in rec["messages"])
+        f"{ {'in': 'guest', 'ops': 'ops team'}.get(m['direction'], 'Gia')}</span> {_e(m['body'])}</div>"
+        for m in rec["messages"])
     staff = store.staff_for_villa(b["villa_id"])
     body = (
         f"<h2>{_e(b['guest_name'])} · {_e(booking_id)}</h2>"
@@ -365,20 +371,18 @@ async def dashboard(msg: str = ""):
     return _page(body, msg, refresh=not msg)
 
 
+async def _set_ticket_status(ticket_id: int, status: str, by: str = "ops") -> dict:
+    try:
+        return await tickets.set_status(ticket_id, status, by=by)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except LookupError:
+        raise HTTPException(404) from None
+
+
 @app.post("/admin/tickets/{ticket_id}/status", dependencies=[Depends(admin)])
 async def change_status(ticket_id: int, status: str = Form(...)):
-    if status not in STATUS_MESSAGES:
-        raise HTTPException(400, "Unknown status")
-    t = store.set_ticket_status(ticket_id, status)
-    if not t:
-        raise HTTPException(404)
-    store.audit(t["booking_id"], f"ticket_status:{status}", "tier0", {"ticket": t["ref"]})
-    if t["source"] in (None, "guest"):  # internal tickets (no-reply flags, delivery failures) aren't the guest's
-        msg = STATUS_MESSAGES[status].format(ref=t["ref"], summary=t["summary"],
-                                             due=t["due_at"][11:16] + " IST")
-        store.log_message(t["phone"], t["booking_id"], "out", msg)
-        store.add_note(t["phone"], f"ops set ticket {t['ref']} to '{status}' and Gia sent the guest: \"{msg}\"")
-        await whatsapp.send_text(t["phone"], msg)
+    await _set_ticket_status(ticket_id, status)
     return RedirectResponse("/admin", status_code=303)
 
 
@@ -548,6 +552,217 @@ async def add_staff(name: str = Form(...), phone: str = Form(""), email: str = F
     return _back("/admin/villas", "", f"Added {name.strip()}.")
 
 
-@app.get("/")
+# ---------------- Ops console (/) ----------------
+# Overview, Guest Journeys and Operations run on the live data below. The guided demo scenarios, the
+# field app's photo evidence and the workflow explorer are scripted in the browser (static/ops/data.js).
+
+OPS_CONSOLE_DIR = Path(__file__).parent / "static" / "ops"
+OPS_CONSOLE_ASSETS = {"console.css", "console.js", "data.js", "live.js", "lohono-logo.jpeg"}
+API = "/api"
+
+
+class StatusChange(BaseModel):
+    status: str
+
+
+class Takeover(BaseModel):
+    on: bool
+
+
+class OpsReply(BaseModel):
+    text: str
+
+
+class Presence(BaseModel):
+    presence: str
+
+
+class Assign(BaseModel):
+    operator_id: int | None
+
+
+class NewOperator(BaseModel):
+    name: str
+    phone: str
+    role: str
+    villa_ids: list[str]
+    presence: str = "onsite"
+
+
+@app.get("/", dependencies=[Depends(admin)])
+async def ops_console():
+    return FileResponse(OPS_CONSOLE_DIR / "index.html")
+
+
+@app.get("/admin/ops")
+async def ops_console_old_address():
+    return RedirectResponse("/", status_code=308)
+
+
+@app.get(f"{API}/state", dependencies=[Depends(admin)])
+async def ops_state():
+    return ops_view.snapshot(["open", *STATUS_MESSAGES])
+
+
+@app.post(f"{API}/tickets/{{ticket_id}}/status", dependencies=[Depends(admin)])
+async def ops_ticket_status(ticket_id: int, body: StatusChange):
+    t = await _set_ticket_status(ticket_id, body.status)
+    return {"ok": True, "ref": t["ref"], "status": t["status"], "guest_messaged": t["source"] in (None, "guest")}
+
+
+@app.post(f"{API}/bookings/{{booking_id}}/takeover", dependencies=[Depends(admin)])
+async def ops_takeover(booking_id: str, body: Takeover):
+    """Ops takes the conversation (Gia stops replying and holds scheduled messages) or hands it back."""
+    b = store.get_booking(booking_id)
+    if not b:
+        raise HTTPException(404)
+    phone = b["guest_phone"]
+    async with _locks[phone]:
+        if body.on == store.takeover_active(phone):
+            return {"ok": True, "takeover": body.on}
+        store.set_takeover(phone, booking_id, body.on)
+        store.audit(booking_id, "ops_takeover" if body.on else "ops_handback", "tier0", {})
+        if not body.on:
+            store.add_note(phone, "the ops team has handed the conversation back to you")
+    return {"ok": True, "takeover": body.on}
+
+
+@app.post(f"{API}/bookings/{{booking_id}}/reply", dependencies=[Depends(admin)])
+async def ops_reply(booking_id: str, body: OpsReply):
+    """A person from ops replies to the guest on WhatsApp during a takeover."""
+    b = store.get_booking(booking_id)
+    if not b:
+        raise HTTPException(404)
+    text, phone = body.text.strip(), b["guest_phone"]
+    if not text:
+        raise HTTPException(400, "Write a message first")
+    if not store.takeover_active(phone):
+        raise HTTPException(409, "Take over the conversation before replying")
+    async with _locks[phone]:
+        try:
+            whatsapp.message_id(await whatsapp.send_text(phone, text))
+        except whatsapp.WhatsAppError as e:
+            if e.code == whatsapp.OUTSIDE_SERVICE_WINDOW:
+                raise HTTPException(502, "Not sent: the guest hasn't written in the last 24 hours, so WhatsApp "
+                                         "only allows an approved template. Call the guest instead.") from e
+            raise HTTPException(502, f"Not sent: {e}") from e
+        store.log_message(phone, booking_id, "ops", text)
+        store.add_note(phone, f"a person from the ops team replied to the guest: \"{text}\"")
+        store.audit(booking_id, "ops_reply", "tier0", {"text": text})
+    return {"ok": True}
+
+
+@app.post(f"{API}/handoffs/{{handoff_id}}/resolve", dependencies=[Depends(admin)])
+async def ops_resolve_handoff(handoff_id: int):
+    h = store.set_handoff_status(handoff_id, "resolved")
+    if not h:
+        raise HTTPException(404)
+    store.audit(h["booking_id"], "handoff_resolved", "tier0", {"handoff": handoff_id})
+    return {"ok": True}
+
+
+@app.post(f"{API}/operators", dependencies=[Depends(admin)])
+async def ops_add_operator(body: NewOperator):
+    """Add a field operator and make them the villas' operator for that role (replacing whoever had it)."""
+    name, phone = body.name.strip(), "".join(ch for ch in body.phone if ch.isdigit())
+    if not name:
+        raise HTTPException(400, "Enter the operator's name")
+    if len(phone) < 10:
+        raise HTTPException(400, "Enter a WhatsApp number with country code, e.g. 9198XXXXXXXX")
+    if body.role not in store.OPERATOR_ROLES:
+        raise HTTPException(400, "Unknown role")
+    if body.presence not in store.PRESENCE:
+        raise HTTPException(400, "Presence must be onsite or offsite")
+    villa_ids = [v for v in body.villa_ids if store.get_villa(v)]
+    if not villa_ids:
+        raise HTTPException(400, "Choose at least one villa")
+    if store.staff_by_phone(phone):
+        raise HTTPException(409, "An operator with this number already exists")
+    staff_id = store.add_staff(name, phone, "", body.presence)
+    store.assign_staff(villa_ids, body.role, staff_id)
+    store.audit(None, "operator_added", "tier0", {"staff_id": staff_id, "name": name, "role": body.role,
+                                                  "villas": villa_ids, "presence": body.presence})
+    return {"ok": True, "id": staff_id}
+
+
+@app.post(f"{API}/operators/{{staff_id}}/presence", dependencies=[Depends(admin)])
+async def ops_operator_presence(staff_id: int, body: Presence):
+    staff = store.get_staff(staff_id)
+    if not staff:
+        raise HTTPException(404)
+    if body.presence not in store.PRESENCE:
+        raise HTTPException(400, "Presence must be onsite or offsite")
+    store.set_presence(staff_id, body.presence)
+    store.audit(None, "operator_presence", "tier0", {"staff_id": staff_id, "name": staff["name"], "presence": body.presence})
+    return {"ok": True}
+
+
+@app.post(f"{API}/operators/{{staff_id}}/message", dependencies=[Depends(admin)])
+async def ops_message_operator(staff_id: int, body: OpsReply):
+    """Ops writes to a field operator on WhatsApp (free text: only within 24 hours of their last message)."""
+    staff = store.get_staff(staff_id)
+    if not staff:
+        raise HTTPException(404)
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(400, "Write a message first")
+    if not staff["phone"]:
+        raise HTTPException(400, f"{staff['name']} has no WhatsApp number")
+    try:
+        await operators.send(staff, None, text, direction="ops")
+    except whatsapp.WhatsAppError as e:
+        if e.code == whatsapp.OUTSIDE_SERVICE_WINDOW:
+            raise HTTPException(502, f"Not sent: {staff['name']} hasn't written in the last 24 hours, so WhatsApp "
+                                     "only allows a template. Call them, or wait for them to reply to their task.") from e
+        raise HTTPException(502, f"Not sent: {e}") from e
+    store.audit(None, "operator_ops_message", "tier0", {"staff_id": staff_id, "text": text})
+    return {"ok": True}
+
+
+@app.post(f"{API}/tickets/{{ticket_id}}/assign", dependencies=[Depends(admin)])
+async def ops_assign_ticket(ticket_id: int, body: Assign):
+    """Give a ticket to another operator (or back to the control tower); the new operator is told on WhatsApp."""
+    t = store.get_ticket(ticket_id)
+    if not t:
+        raise HTTPException(404)
+    staff = store.get_staff(body.operator_id) if body.operator_id is not None else None
+    if body.operator_id is not None and not staff:
+        raise HTTPException(404, "No such operator")
+    if staff and staff["id"] == t["operator_id"]:
+        return {"ok": True, "assignee": t["assignee"]}
+    assignee = operators.label({**staff, "role": operators.role_for(staff["id"], t["villa_id"])}) if staff \
+        else "Ops control tower"
+    t = store.assign_ticket(ticket_id, staff["id"] if staff else None, assignee)
+    store.audit(t["booking_id"], "ticket_assigned", "tier0", {"ticket": t["ref"], "to": assignee})
+    if staff and t["status"] != "closed":
+        booking = store.get_booking(t["booking_id"]) or {"guest_name": "-", "booking_id": t["booking_id"], "check_in": "-"}
+        await operators.notify_assignment(t, booking)
+    return {"ok": True, "assignee": assignee}
+
+
+@app.post(f"{API}/tickets/{{ticket_id}}/done", dependencies=[Depends(admin)])
+async def ops_operator_done(ticket_id: int):
+    """The field app's "Mark done": the ticket's operator finished the task."""
+    t = store.get_ticket(ticket_id)
+    if not t:
+        raise HTTPException(404)
+    staff = store.get_staff(t["operator_id"])
+    if not staff:
+        raise HTTPException(409, "Assign an operator first")
+    if t["status"] == "closed":
+        raise HTTPException(409, f"{t['ref']} is already closed")
+    closed = await operators.mark_done(t, staff, "field app")
+    return {"ok": True, "ref": closed["ref"], "minutes": operators.minutes_to_resolve(closed),
+            "guest_messaged": closed["source"] in (None, "guest")}
+
+
+@app.get("/ops/{name}", dependencies=[Depends(admin)])
+async def ops_console_asset(name: str):
+    if name not in OPS_CONSOLE_ASSETS:
+        raise HTTPException(status_code=404)
+    return FileResponse(OPS_CONSOLE_DIR / name)
+
+
+@app.get("/health")
 async def health():
     return {"service": "gia-whatsapp-demo", "ok": True}

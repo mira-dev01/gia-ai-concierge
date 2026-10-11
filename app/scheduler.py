@@ -220,6 +220,8 @@ async def _process(step: dict, force: bool = False) -> None:
         return  # the welcome always goes first
 
     phone = booking["guest_phone"]
+    if not force and store.takeover_active(phone):
+        return  # a person from ops is handling this guest; send once they hand back to Gia
     days_left = (date.fromisoformat(booking["check_in"]) - now.date()).days
     pre_arrival_at = _pre_arrival_sent_at(steps)
     if days_left < 0:
