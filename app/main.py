@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Red
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
-from . import agent, config, operators, ops_view, scheduler, store, tickets, whatsapp
+from . import agent, config, operators, ops_view, property_view, scheduler, store, tickets, whatsapp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("gia")
@@ -78,8 +78,12 @@ async def receive(request: Request, background: BackgroundTasks):
                 if store.first_time_seen(msg["id"]):  # Meta retries deliveries; handle each message once
                     background.add_task(_handle_incoming, msg)
             for st in value.get("statuses", []):
+                error = None
                 if st.get("status") == "failed":
                     log.error("Delivery failed to %s: %s", st.get("recipient_id"), st.get("errors"))
+                    err = (st.get("errors") or [{}])[0]
+                    error = f"{err.get('code')}: {err.get('title') or err.get('message') or ''}"
+                background.add_task(store.message_receipt, st.get("id") or "", st.get("status"), error)
                 background.add_task(scheduler.on_delivery_status, st)  # UC-OPS-01 delivered / read / failed
     return {"ok": True}  # acknowledge fast; Meta expects a 200 quickly
 
@@ -128,9 +132,10 @@ async def _converse(phone: str, text: str, send: bool) -> str:
             log.exception("Gia failed for %s", phone)
             tickets.raise_handoff(booking, phone, f"Gia errored on: {text}", "normal")  # NFR-08
             answer = "Sorry, I'm having trouble right now. I've asked someone from the Lohono team to reply to you."
-        store.log_message(phone, booking_id, "out", answer)
         if send:
-            await whatsapp.send_text(phone, answer)
+            await whatsapp.send_logged(phone, booking_id, answer)
+        else:
+            store.log_message(phone, booking_id, "out", answer)  # simulated in the console: nothing is sent
         return answer
 
 
@@ -376,9 +381,9 @@ async def dashboard(msg: str = ""):
     return _page(body, msg, refresh=not msg)
 
 
-async def _set_ticket_status(ticket_id: int, status: str, by: str = "ops") -> dict:
+async def _set_ticket_status(ticket_id: int, status: str, by: str = "ops", note: str | None = None) -> dict:
     try:
-        return await tickets.set_status(ticket_id, status, by=by)
+        return await tickets.set_status(ticket_id, status, by=by, note=note)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
     except LookupError:
@@ -558,16 +563,23 @@ async def add_staff(name: str = Form(...), phone: str = Form(""), email: str = F
 
 
 # ---------------- Ops console (/) ----------------
-# Overview, Guest Journeys and Operations run on the live data below. The guided demo scenarios, the
+# Overview, Properties and Operations run on the live data below. The guided demo scenarios, the
 # field app's photo evidence and the workflow explorer are scripted in the browser (static/ops/data.js).
 
 OPS_CONSOLE_DIR = Path(__file__).parent / "static" / "ops"
-OPS_CONSOLE_ASSETS = {"console.css", "console.js", "data.js", "live.js", "lohono-logo.jpeg"}
+OPS_CONSOLE_ASSETS = {"console.css", "console.js", "data.js", "live.js", "ui.js", "properties.js", "conversation.js",
+                      "operations.js", "lohono-logo.jpeg"}
 API = "/api"
 
 
 class StatusChange(BaseModel):
     status: str
+    note: str | None = None  # how it was resolved, when closing
+
+
+class Escalation(BaseModel):
+    on: bool
+    reason: str = ""
 
 
 class Takeover(BaseModel):
@@ -609,10 +621,66 @@ def ops_state():  # sync on purpose: FastAPI runs it in a worker thread, so its 
     return ops_view.snapshot(["open", *STATUS_MESSAGES])
 
 
+@app.get(f"{API}/properties", dependencies=[Depends(admin)])
+def ops_properties(q: str = "", stay: str = "all", arrivals: str = "", blockers: bool = False, location: str = "",
+                   manager: str = "", sort: str = "arrival", offset: int = 0, limit: int = 50):
+    """One page of the property register, searched, filtered and sorted here rather than in the browser."""
+    try:
+        return property_view.register(q=q, stay=stay, arrivals=arrivals, blockers=blockers, location=location,
+                                      manager=manager, sort=sort, offset=offset, limit=limit)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.get(f"{API}/properties/{{villa_id}}", dependencies=[Depends(admin)])
+def ops_property(villa_id: str):
+    p = property_view.profile(villa_id)
+    if not p:
+        raise HTTPException(404, "No such property")
+    return p
+
+
+@app.get(f"{API}/bookings/{{booking_id}}/conversation", dependencies=[Depends(admin)])
+def ops_conversation(booking_id: str):
+    c = ops_view.conversation(booking_id)
+    if not c:
+        raise HTTPException(404, "No such booking")
+    return c
+
+
+@app.get(f"{API}/tickets/{{ticket_id}}", dependencies=[Depends(admin)])
+def ops_ticket(ticket_id: int):
+    t = ops_view.ticket(ticket_id)
+    if not t:
+        raise HTTPException(404, "No such ticket")
+    return t
+
+
+@app.get(f"{API}/operators/{{staff_id}}", dependencies=[Depends(admin)])
+def ops_operator(staff_id: int):
+    o = ops_view.operator(staff_id)
+    if not o:
+        raise HTTPException(404, "No such operator")
+    return o
+
+
 @app.post(f"{API}/tickets/{{ticket_id}}/status", dependencies=[Depends(admin)])
 async def ops_ticket_status(ticket_id: int, body: StatusChange):
-    t = await _set_ticket_status(ticket_id, body.status)
+    note = (body.note or "").strip() or None
+    t = await _set_ticket_status(ticket_id, body.status, note=note)
     return {"ok": True, "ref": t["ref"], "status": t["status"], "guest_messaged": t["source"] in (None, "guest")}
+
+
+@app.post(f"{API}/tickets/{{ticket_id}}/escalate", dependencies=[Depends(admin)])
+async def ops_ticket_escalate(ticket_id: int, body: Escalation):
+    """Flag a ticket as escalated, or clear the flag. Independent of its status; the guest isn't messaged."""
+    try:
+        t = tickets.set_escalation(ticket_id, body.on, body.reason)
+    except LookupError:
+        raise HTTPException(404) from None
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"ok": True, "ref": t["ref"], "escalated": bool(t["escalated_at"])}
 
 
 @app.post(f"{API}/bookings/{{booking_id}}/takeover", dependencies=[Depends(admin)])
@@ -645,13 +713,16 @@ async def ops_reply(booking_id: str, body: OpsReply):
         raise HTTPException(409, "Take over the conversation before replying")
     async with _locks[phone]:
         try:
-            whatsapp.message_id(await whatsapp.send_text(phone, text))
+            wa_id = whatsapp.message_id(await whatsapp.send_text(phone, text))
         except whatsapp.WhatsAppError as e:
             if e.code == whatsapp.OUTSIDE_SERVICE_WINDOW:
                 raise HTTPException(502, "Not sent: the guest hasn't written in the last 24 hours, so WhatsApp "
                                          "only allows an approved template. Call the guest instead.") from e
             raise HTTPException(502, f"Not sent: {e}") from e
-        store.log_message(phone, booking_id, "ops", text)
+        except Exception as e:  # the request to WhatsApp itself failed
+            log.exception("Ops reply to %s failed", booking_id)
+            raise HTTPException(502, "Not sent: WhatsApp couldn't be reached. Try again.") from e
+        store.log_message(phone, booking_id, "ops", text, status="sent" if wa_id else "not_sent", wa_message_id=wa_id)
         store.add_note(phone, f"a person from the ops team replied to the guest: \"{text}\"")
         store.audit(booking_id, "ops_reply", "tier0", {"text": text})
     return {"ok": True}

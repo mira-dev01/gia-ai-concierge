@@ -52,20 +52,37 @@ def raise_ticket(booking: dict, phone: str, category: str, severity: str, summar
     return t
 
 
-async def set_status(ticket_id: int, status: str, by: str = "ops") -> dict:
+async def set_status(ticket_id: int, status: str, by: str = "ops", note: str | None = None) -> dict:
     """Move a ticket on. For a guest's own request, Gia tells the guest on WhatsApp (UC-OPS-05 step 5).
-    Closing records the time to resolve; `by` says who closed it (ops, or the operator and how)."""
+    Closing records the time to resolve; `by` says who closed it (ops, or the operator and how) and `note` how."""
     if status not in STATUS_MESSAGES:
         raise ValueError("Unknown status")
-    t = store.set_ticket_status(ticket_id, status, by=by)
+    t = store.set_ticket_status(ticket_id, status, by=by, note=note)
     if not t:
         raise LookupError("No such ticket")
-    store.audit(t["booking_id"], f"ticket_status:{status}", "tier0", {"ticket": t["ref"], "by": by})
+    store.audit(t["booking_id"], f"ticket_status:{status}", "tier0",
+                {"ticket": t["ref"], "by": by, **({"note": note} if note else {})})
     if t["source"] in (None, "guest"):  # internal tickets (no-reply flags, delivery failures) aren't the guest's
         msg = STATUS_MESSAGES[status].format(ref=t["ref"], summary=t["summary"], due=t["due_at"][11:16] + " IST")
-        store.log_message(t["phone"], t["booking_id"], "out", msg)
         store.add_note(t["phone"], f"ticket {t['ref']} was set to '{status}' by {by} and Gia sent the guest: \"{msg}\"")
-        await whatsapp.send_text(t["phone"], msg)
+        await whatsapp.send_logged(t["phone"], t["booking_id"], msg)
+    return t
+
+
+def set_escalation(ticket_id: int, on: bool, reason: str = "", by: str = "ops") -> dict:
+    """Flag a ticket as escalated (or clear the flag). Escalation sits beside the status: an in-progress ticket
+    can be escalated and overdue at once. It puts the ticket at the top of every attention list; it doesn't
+    message the guest, and closing the ticket clears it."""
+    t = store.get_ticket(ticket_id)
+    if not t:
+        raise LookupError("No such ticket")
+    if on and t["status"] == "closed":
+        raise ValueError(f"{t['ref']} is resolved; reopen it before escalating")
+    if on and not reason.strip():
+        raise ValueError("Say why it's escalated")
+    t = store.set_ticket_escalation(ticket_id, on, reason.strip() or None)
+    store.audit(t["booking_id"], "ticket_escalated" if on else "ticket_deescalated", "tier0",
+                {"ticket": t["ref"], "by": by, **({"reason": reason.strip()} if on else {})})
     return t
 
 

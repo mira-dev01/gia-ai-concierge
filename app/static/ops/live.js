@@ -1,21 +1,39 @@
-// Live data for the ops console: talking to the backend (/admin/ops/api) and turning its records
+// Live data for the ops console: talking to the backend (/api) and turning its records
 // (bookings, WhatsApp transcripts, tickets, handoffs, the audit log) into what the screens draw.
+// Status rules (occupancy, booking status, readiness, what needs attention) are decided by the backend
+// (app/portfolio.py), so every screen shows the same answer; this file only formats them.
 // Times arrive as IST ISO strings and are shown in IST whatever the browser's time zone.
 
 const API = '/api';
 
-export async function api(method, path, body) {
+// signal: an AbortSignal, so a request for a property or conversation the user has already left can be dropped.
+export async function api(method, path, body, signal) {
   const res = await fetch(API + path, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : {},
     body: body ? JSON.stringify(body) : undefined,
-    credentials: 'same-origin'
+    credentials: 'same-origin',
+    signal
   });
   if (res.status === 401) throw new Error('Signed out. Reload the page and sign in again.');
   let data = null;
   try { data = await res.json(); } catch (e) { /* empty or non-JSON body */ }
   if (!res.ok) throw new Error((data && data.detail) || `Request failed (${res.status})`);
   return data;
+}
+
+// One loader per panel: each call cancels the previous request, and a reply that arrives after a newer request
+// was made is dropped, so a slow answer for a property or conversation the user has left never shows.
+export function latest() {
+  let ctl = null, seq = 0;
+  return (path, onData, onError) => {
+    if (ctl) ctl.abort();
+    ctl = new AbortController();
+    const mine = ++seq;
+    api('GET', path, null, ctl.signal)
+      .then(data => { if (mine === seq) onData(data); })
+      .catch(e => { if (e.name !== 'AbortError' && mine === seq) onError(e.message); });
+  };
 }
 
 // ---------- formatting ----------
@@ -56,11 +74,25 @@ export function duration(min) {
   return `${Math.floor(h / 24)} d ${h % 24} h`;
 }
 export const ago = (iso, now) => { const m = minutesBetween(iso, now); return m < 1 ? 'just now' : duration(m) + ' ago'; };
+// "today", "tomorrow", "in 3 days", "2 days ago"
+export function relDays(n) {
+  if (n === null || n === undefined) return '';
+  if (n === 0) return 'today';
+  if (n === 1) return 'tomorrow';
+  if (n === -1) return 'yesterday';
+  return n > 0 ? `in ${n} days` : `${-n} days ago`;
+}
+// Minutes until a time (negative once it has passed), e.g. for due times.
+export const minutesUntil = (iso, now) => Math.round((Date.parse(iso) - Date.parse(now)) / 60000);
+export const query = params => {
+  const q = Object.entries(params).filter(([, v]) => v !== '' && v !== null && v !== undefined && v !== false);
+  return q.length ? '?' + q.map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&') : '';
+};
 export const initials = name => name.split(' ').filter(Boolean).map(x => x[0]).slice(0, 2).join('');
 
 // ---------- tickets ----------
 
-export const STATUS_LABEL = { open: 'Open', acknowledged: 'Acknowledged', in_progress: 'In progress', delayed: 'Delayed', closed: 'Closed' };
+export const STATUS_LABEL = { open: 'Open', acknowledged: 'Acknowledged', in_progress: 'In progress', delayed: 'Delayed', closed: 'Resolved' };
 const STATUS_PILL = {
   open: ['#E7ECEF', '#3E5263', '○'],
   acknowledged: ['#E7ECEF', '#3E5263', '◐'],
@@ -70,78 +102,60 @@ const STATUS_PILL = {
 };
 export const statusPill = s => { const m = STATUS_PILL[s] || ['#F1EBE6', '#6E6762', '·']; return { bg: m[0], fg: m[1], icon: m[2] }; };
 const SEVERITY = { urgent: ['#A8382A', '▲'], high: ['#A8382A', '▲'], medium: ['#7A4F0C', '◆'], low: ['#6E6762', '·'] };
+export const severityMark = sev => { const m = SEVERITY[sev] || ['#6E6762', '·']; return { color: m[0], glyph: m[1], label: titleCase(sev) }; };
+export const SEVERITY_ORDER = { urgent: 0, high: 1, medium: 2, low: 3 };
 const FLOW = ['open', 'acknowledged', 'in_progress', 'closed'];
 const SOURCE_LABEL = { guest: 'Guest via WhatsApp', 'uc-ops-01': 'Pre-arrival check', system: 'System' };
 
 export function ticketView(t, now) {
-  const sev = SEVERITY[t.severity] || ['#6E6762', '·'];
   let list = FLOW, idx = FLOW.indexOf(t.status);
   if (t.status === 'delayed') { list = FLOW.slice(0, 3).concat(['delayed']); idx = 3; }
   return {
     ...t,
     status: STATUS_LABEL[t.status] || titleCase(t.status), statusKey: t.status,
     pill: statusPill(t.status),
-    cat: titleCase(t.category), sev: titleCase(t.severity), sevColor: sev[0], sevGlyph: sev[1],
-    title: t.summary, owner: t.assignee, ownerShort: t.assignee.split(/[,·(]/)[0].trim(),
     origin: SOURCE_LABEL[t.source] || titleCase(t.source),
-    updated: when(t.updated_at, now), due: whenFull(t.due_at, now),
-    timeFlag: timeFlag(t, now),
+    due: whenFull(t.due_at, now),
     resolvedText: t.status === 'closed' && t.resolve_minutes !== null
       ? `Resolved in ${duration(t.resolve_minutes)}${t.resolved_by ? ' by ' + t.resolved_by : ''} · ${t.within_sla ? 'within' : 'over'} SLA` : '',
     flowItems: list.map((x, i) => ({ label: STATUS_LABEL[x], bg: i <= idx ? (x === 'delayed' ? '#C2412E' : i === idx ? '#1A1714' : '#53735E') : '#E8DDD4', fg: i <= idx ? '#1A1714' : '#6A625C' })),
-    history: t.history.map(h => ({ time: when(h.at, now), title: h.title, text: h.text }))
+    dueText: dueText(t, now)
   };
 }
 
-// Open: how long it's been open (red once past its SLA). Closed: how long it took (red if over its SLA).
-export function timeFlag(t, now) {
-  if (t.status === 'closed') {
-    if (t.resolve_minutes === null) return null;
-    return { text: '✓ ' + duration(t.resolve_minutes), color: t.within_sla ? '#2F4A38' : '#A8382A', bg: t.within_sla ? '#E6EEE7' : '#F6DCD8', title: t.within_sla ? 'Resolved within SLA' : 'Resolved after its SLA' };
-  }
-  const open = duration(minutesBetween(t.created_at, now));
-  return t.overdue
-    ? { text: 'Open ' + open, color: '#A8382A', bg: '#F6DCD8', title: 'Past its expected time' }
-    : { text: 'Open ' + open, color: '#6B440B', bg: '#FBF3E4', title: 'Open' };
+// The queue's due column: how long overdue, how long until due, or how long it took.
+export function dueText(t, now) {
+  if (t.status === 'closed') return t.resolve_minutes !== null ? { text: 'Took ' + duration(t.resolve_minutes), tone: t.within_sla ? 'ok' : 'warn' } : { text: 'Resolved', tone: 'ok' };
+  if (!t.due_at) return { text: 'No due time', tone: '' };
+  const m = minutesUntil(t.due_at, now);
+  return m < 0 ? { text: 'Overdue ' + duration(-m), tone: 'bad' } : { text: 'Due in ' + duration(m), tone: m < 30 ? 'warn' : '' };
 }
 
 // ---------- needs a person ----------
 
-// Everything a person should act on now, most urgent first: guests waiting for a person, then open tickets that are
-// urgent, overdue, delayed or have no operator. Each item says what state it's in and the next thing to do.
-// Overview's list and the navigation badges both come from here, so their counts always agree.
-export function attention(live) {
-  const items = [];
-  live.handoffs.filter(h => h.status === 'waiting').forEach(h => items.push({
-    key: 'HO-' + h.id, kind: 'handoff', booking: h.booking_id, villa: h.villa, at: h.at,
-    urgent: h.urgency === 'urgent', rank: h.urgency === 'urgent' ? 0 : 1,
-    title: h.reason, who: [h.guest, h.villa].filter(Boolean).join(' · '), ref: `HO-${h.id}`,
-    state: h.urgency === 'urgent' ? 'Urgent · needs a person' : 'Waiting for a person', tone: 'red',
-    action: 'Take over chat'
-  }));
-  live.tickets.filter(t => t.status !== 'closed').forEach(t => {
-    const unassigned = !t.operator_id;
-    const reasons = [t.severity === 'urgent' && 'Urgent', t.overdue && 'Overdue', t.status === 'delayed' && 'Delayed',
-      unassigned && 'Unassigned'].filter(Boolean);
-    if (!reasons.length) return;
-    items.push({
-      key: t.ref, kind: 'ticket', ref: t.ref, booking: t.booking_id, villa: t.villa, at: t.created_at,
-      urgent: t.severity === 'urgent',
-      rank: t.severity === 'urgent' ? 0 : t.overdue ? 2 : t.status === 'delayed' ? 3 : 4,
-      title: t.summary, who: [t.guest, t.villa].filter(Boolean).join(' · '),
-      state: reasons.join(' · ') + (t.overdue ? ` · was due ${whenFull(t.due_at, live.now)}` : ''),
-      tone: t.severity === 'urgent' || t.overdue || t.status === 'delayed' ? 'red' : 'amber',
-      status: STATUS_LABEL[t.status] || titleCase(t.status), pill: statusPill(t.status),
-      action: unassigned ? 'Assign operator' : 'Update progress'
-    });
-  });
-  return items.sort((a, b) => a.rank - b.rank || a.at.localeCompare(b.at));
+// The backend decides what needs attention (app/portfolio.py); this adds the words and tone each screen shows.
+export const SEVERITY_TONE = { critical: 'red', high: 'red', medium: 'amber' };
+export function attentionState(a, now) {
+  const due = a.reasons.includes('Overdue') && a.due_at ? ` · was due ${whenFull(a.due_at, now)}` : '';
+  return a.reasons.join(' · ') + due;
 }
 
 // ---------- a booking's conversation, profile and activity ----------
 
-const STAGE_ORDER = { 'In stay': 0, 'Pre-arrival': 1, 'Post-stay': 2, 'Cancelled': 3 };
-export const sortBookings = bookings => bookings.slice().sort((a, b) => STAGE_ORDER[a.stage] - STAGE_ORDER[b.stage] || a.check_in.localeCompare(b.check_in));
+const STAGE_ORDER = { 'In stay': 0, 'Pre-arrival': 1, 'Tentative': 2, 'Unconfirmed': 3, 'Post-stay': 4, 'Cancelled': 5 };
+export const sortBookings = bookings => bookings.slice().sort((a, b) => (STAGE_ORDER[a.stage] ?? 9) - (STAGE_ORDER[b.stage] ?? 9) || a.check_in.localeCompare(b.check_in));
+
+// A villa's stay status: tone and a glyph, so it never relies on colour alone.
+export const STAY_TONE = {
+  occupied: ['ok', '●'], checkout: ['warn', '◑'], turnover: ['warn', '⇄'], pre_arrival: ['info', '◔'],
+  vacant: ['neutral', '○'], conflict: ['bad', '▲'], unknown: ['bad', '?']
+};
+export const READINESS_TONE = { blocked: ['bad', '▲'], not_assessed: ['neutral', '–'], in_progress: ['warn', '◔'], ready: ['ok', '✓'] };
+// Delivery of a message sent to the guest, in words (with a glyph) rather than colour alone.
+export const DELIVERY = {
+  pending: ['Sending…', '◌', ''], sent: ['Sent', '✓', ''], delivered: ['Delivered', '✓✓', ''], read: ['Read', '✓✓', 'ok'],
+  failed: ['Not delivered', '!', 'bad'], not_sent: ['Not sent · dry run', '–', 'warn']
+};
 
 export function party(b) {
   const parts = [];
@@ -151,20 +165,29 @@ export function party(b) {
   return parts.join(' · ') || 'Not recorded';
 }
 
-// WhatsApp messages plus ticket events, oldest first, with a date marker at each new day.
-export function chatItems(b, tickets, now, openTicket) {
-  const events = b.messages.map(m => ({ at: m.at, kind: m.direction === 'in' ? 'guest' : m.direction === 'ops' ? 'ops' : 'gia', text: m.body }));
-  tickets.forEach(t => {
-    events.push({ at: t.created_at, kind: 'chip', text: `${t.ref} created · ${titleCase(t.category)}`, go: () => openTicket(t.ref) });
-    t.history.filter(h => h.who === 'human' && h.title.startsWith(t.ref + ' →'))
-      .forEach(h => events.push({ at: h.at, kind: 'chip', text: h.title.replace('→', '·'), go: () => openTicket(t.ref) }));
-  });
-  const NOTES = { ops_takeover: 'Ops took over this chat · Gia paused', ops_handback: 'Handed back to Gia', handoff_raised: null };
-  b.activity.slice().reverse().forEach(a => {  // activity is newest first; notes go in oldest first
-    if (!(a.action in NOTES)) return;
-    events.push({ at: a.at, kind: 'note', text: NOTES[a.action] || `Gia asked for a person · ${a.text}` });
+// A conversation's WhatsApp messages plus its takeovers, handoffs and ticket changes, oldest first, with a date
+// marker at each new day. `c` is the /bookings/{id}/conversation payload.
+export function chatItems(c, now, openTicket) {
+  const events = c.messages.map(m => ({
+    at: m.at, id: m.id, kind: m.direction === 'in' ? 'guest' : m.direction === 'ops' ? 'ops' : 'gia', text: m.body,
+    delivery: m.direction === 'in' ? null : m.status, error: m.error
+  }));
+  c.tickets.forEach(t => events.push({ at: t.created_at, kind: 'chip', text: `${t.ref} created · ${titleCase(t.category)}`, go: () => openTicket(t) }));
+  c.events.forEach(a => {
+    if (a.action === 'ops_takeover') events.push({ at: a.at, kind: 'note', text: 'Ops took over this chat · Gia paused' });
+    else if (a.action === 'ops_handback') events.push({ at: a.at, kind: 'note', text: 'Handed back to Gia' });
+    else if (a.action === 'handoff_raised') events.push({ at: a.at, kind: 'note', text: `Gia asked for a person · ${a.text}` });
+    else if (a.ticket) {
+      const t = c.tickets.find(x => x.ref === a.ticket);
+      events.push({ at: a.at, kind: 'chip', text: a.title.replace('→', '·'), go: t ? () => openTicket(t) : null });
+    }
   });
   events.sort((a, b) => a.at < b.at ? -1 : a.at > b.at ? 1 : 0);  // stable: messages stay ahead of same-second chips
+  return withDays(events, now);
+}
+
+// Chat items in time order, with a date marker wherever the day changes.
+function withDays(events, now) {
   const out = [];
   let lastDay = null;
   events.forEach(e => {
@@ -180,8 +203,8 @@ const STEP_STATE = {
   failed: ['✕', '#C2412E'], skipped: ['–', '#6A625C'], cancelled: ['–', '#6A625C']
 };
 
-export function journeyRows(b, now) {
-  return b.journey.map(j => {
+export function journeyRows(journey, now) {
+  return journey.map(j => {
     const st = STEP_STATE[j.status] || ['·', '#6A625C'];
     const at = { scheduled: j.due_at, sent: j.sent_at, delivered: j.delivered_at, read: j.read_at }[j.status];
     return { k: j.step, glyph: st[0], color: st[1], note: titleCase(j.status) + (at ? ' · ' + whenFull(at, now) : '') + (j.note && j.status !== 'scheduled' ? ` (${j.note})` : '') };
@@ -204,14 +227,13 @@ export function roleSummary(op) {
   return Object.entries(byRole).map(([role, villas]) => `${ROLE_LABEL[role] || titleCase(role)} · ${villas.join(', ')}`).join(' / ') || 'No villa assigned';
 }
 
-// The operator's WhatsApp thread as they see it on their phone, with a date marker at each new day.
+// An operator's WhatsApp thread as chat items (the same bubbles as a guest's chat): the operator on the left,
+// Gia and ops on the right, notes in the middle.
 export function operatorChat(op, now) {
-  const out = [];
-  let lastDay = null;
-  op.messages.forEach(m => {
-    const day = m.at.slice(0, 10) === now.slice(0, 10) ? 'Today' : dayLabel(m.at);
-    if (day !== lastDay) { out.push({ kind: 'date', text: day }); lastDay = day; }
-    out.push({ kind: m.direction, text: m.body, time: clock(m.at), ref: m.ticket_ref });
-  });
-  return out;
+  const first = op.name.split(' ')[0];
+  const KIND = { in: ['guest', first], out: ['gia', 'Gia'], ops: ['ops', 'Ops team'], note: ['note', null] };
+  return withDays(op.messages.map(m => {
+    const [kind, who] = KIND[m.direction] || ['note', null];
+    return { at: m.at, kind, who, text: m.body, ref: m.ticket_ref };
+  }), now);
 }

@@ -6,7 +6,7 @@ import logging
 
 import httpx
 
-from . import config
+from . import config, store
 
 log = logging.getLogger("gia.whatsapp")
 
@@ -60,6 +60,22 @@ async def send_text(to: str, body: str) -> dict:
             "text": {"preview_url": False, "body": body[start:start + MAX_TEXT]},
         }))
     return next((r for r in results if "error" in r), results[0] if results else {})
+
+
+async def send_logged(phone: str, booking_id: str | None, body: str, direction: str = "out") -> str:
+    """Send free text to a guest and log it with its delivery state, so the console never shows a failed send
+    as sent. Returns the state: sent, not_sent (DRY_RUN or no token) or failed. Delivery receipts move it on."""
+    row = store.log_message(phone, booking_id, direction, body, status="pending")
+    try:
+        wa_id = message_id(await send_text(phone, body))
+    except Exception as e:  # Meta refused it, or the request itself failed
+        log.warning("Message to %s not delivered: %s", phone, e)
+        store.set_message_status(row, "failed", error=str(e)[:300])
+        store.audit(booking_id, "message_failed", "tier0", {"error": str(e)[:300], "direction": direction})
+        return "failed"
+    status = "sent" if wa_id else "not_sent"
+    store.set_message_status(row, status, wa_message_id=wa_id)
+    return status
 
 
 async def send_template(to: str, name: str, lang: str, body_params: list[str] | None = None) -> dict:

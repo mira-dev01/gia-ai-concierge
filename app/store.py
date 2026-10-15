@@ -144,6 +144,17 @@ def init() -> None:
         _add_column(c, "tickets", "resolved_at", "TEXT")
         _add_column(c, "tickets", "resolved_by", "TEXT")
         _add_column(c, "staff", "presence", "TEXT NOT NULL DEFAULT 'onsite'")
+        _add_column(c, "tickets", "escalated_at", "TEXT")  # escalation is a flag, independent of the status
+        _add_column(c, "tickets", "escalation_reason", "TEXT")
+        _add_column(c, "tickets", "resolution_note", "TEXT")
+        # Delivery of messages sent to the guest: pending, sent, delivered, read, failed, or not_sent (DRY_RUN).
+        # Empty for the guest's own messages and for chats simulated in the console.
+        _add_column(c, "transcript", "status", "TEXT")
+        _add_column(c, "transcript", "wa_message_id", "TEXT")
+        _add_column(c, "transcript", "error", "TEXT")
+        c.execute("CREATE INDEX IF NOT EXISTS transcript_booking ON transcript (booking_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS transcript_wamid ON transcript (wa_message_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS audit_booking ON audit (booking_id)")
         # Sample bookings count as confirmed the first time the service sees them. An edit to bookings.json
         # is applied on the next start; otherwise changes made by OI events are kept.
         for b in _seed_bookings:
@@ -177,6 +188,12 @@ def all_bookings() -> list[dict]:
     with _db() as c:
         rows = c.execute("SELECT data FROM bookings ORDER BY booking_id").fetchall()
     return [json.loads(r["data"]) for r in rows]
+
+
+def bookings_updated_at() -> str | None:
+    """When OI last changed a booking here: the freshness of every occupancy and arrival the console shows."""
+    with _db() as c:
+        return c.execute("SELECT MAX(updated_at) AS at FROM bookings").fetchone()["at"]
 
 
 def get_booking(booking_id: str) -> dict | None:
@@ -251,12 +268,70 @@ def reset_history(phone: str) -> None:
         c.execute("DELETE FROM conversations WHERE phone = ?", (phone,))
 
 
-def log_message(phone: str, booking_id: str | None, direction: str, body: str) -> None:
+def log_message(phone: str, booking_id: str | None, direction: str, body: str, status: str | None = None,
+                wa_message_id: str | None = None) -> int:
     with _db() as c:
-        c.execute(
-            "INSERT INTO transcript (phone, booking_id, direction, body, at) VALUES (?, ?, ?, ?, ?)",
-            (phone, booking_id, direction, body, now().isoformat()),
+        return c.insert(
+            "INSERT INTO transcript (phone, booking_id, direction, body, at, status, wa_message_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (phone, booking_id, direction, body, now().isoformat(), status, wa_message_id),
         )
+
+
+def set_message_status(message_id: int, status: str, wa_message_id: str | None = None,
+                       error: str | None = None) -> None:
+    with _db() as c:
+        c.execute("UPDATE transcript SET status = ?, wa_message_id = COALESCE(?, wa_message_id), error = ? "
+                  "WHERE id = ?", (status, wa_message_id, error, message_id))
+
+
+def message_receipt(wa_message_id: str, status: str, error: str | None = None) -> None:
+    """A WhatsApp delivery receipt for a logged message. Receipts only move a message forward
+    (sent -> delivered -> read); a failure overrides whatever came before."""
+    if not wa_message_id:
+        return
+    earlier = {"delivered": ("pending", "sent"), "read": ("pending", "sent", "delivered")}.get(status)
+    with _db() as c:
+        if status == "failed":
+            c.execute("UPDATE transcript SET status = 'failed', error = ? WHERE wa_message_id = ?",
+                      (error, wa_message_id))
+        elif earlier:
+            c.execute(f"UPDATE transcript SET status = ? WHERE wa_message_id = ? AND status IN "
+                      f"({', '.join('?' * len(earlier))})", (status, wa_message_id, *earlier))
+
+
+def messages_for_booking(booking_id: str, limit: int) -> tuple[list[dict], int]:
+    """The booking's latest messages (oldest first) and how many it has in all."""
+    with _db() as c:
+        rows = c.execute("SELECT * FROM transcript WHERE booking_id = ? ORDER BY id DESC LIMIT ?",
+                         (booking_id, limit)).fetchall()
+        total = c.execute("SELECT COUNT(*) AS n FROM transcript WHERE booking_id = ?", (booking_id,)).fetchone()["n"]
+    return [dict(r) for r in reversed(rows)], total
+
+
+def message_counts(booking_ids: list[str]) -> dict[str, dict]:
+    """{booking_id: {"count", "last_at"}} for the bookings that have messages."""
+    if not booking_ids:
+        return {}
+    with _db() as c:
+        rows = c.execute(f"SELECT booking_id, COUNT(*) AS n, MAX(at) AS last_at FROM transcript WHERE booking_id IN "
+                         f"({', '.join('?' * len(booking_ids))}) GROUP BY booking_id", tuple(booking_ids)).fetchall()
+    return {r["booking_id"]: {"count": r["n"], "last_at": r["last_at"]} for r in rows}
+
+
+def last_inbound_by_booking() -> dict[str, str]:
+    with _db() as c:
+        rows = c.execute("SELECT booking_id, MAX(at) AS at FROM transcript WHERE direction = 'in' "
+                         "AND booking_id IS NOT NULL GROUP BY booking_id").fetchall()
+    return {r["booking_id"]: r["at"] for r in rows}
+
+
+def last_outbound_status_by_booking() -> dict[str, str | None]:
+    """Delivery status of the latest message sent to each booking's guest (by Gia or by ops)."""
+    with _db() as c:
+        rows = c.execute("SELECT booking_id, status FROM transcript WHERE id IN (SELECT MAX(id) FROM transcript "
+                         "WHERE direction IN ('out', 'ops') AND booking_id IS NOT NULL GROUP BY booking_id)").fetchall()
+    return {r["booking_id"]: r["status"] for r in rows}
 
 
 def transcript(limit: int = 200) -> list[dict]:
@@ -278,6 +353,16 @@ def audit(booking_id: str | None, action: str, tier: str, data: dict) -> None:
 def audit_log(limit: int = 100) -> list[dict]:
     with _db() as c:
         rows = c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def audit_for_bookings(booking_ids: list[str], limit: int = 100) -> list[dict]:
+    """Audit entries for these bookings, newest first."""
+    if not booking_ids:
+        return []
+    with _db() as c:
+        rows = c.execute(f"SELECT * FROM audit WHERE booking_id IN ({', '.join('?' * len(booking_ids))}) "
+                         "ORDER BY id DESC LIMIT ?", (*booking_ids, limit)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -327,16 +412,26 @@ def all_tickets() -> list[dict]:
     return [_ticket_view(r) for r in rows]
 
 
-def set_ticket_status(ticket_id: int, status: str, by: str | None = None) -> dict | None:
-    """Closing records when and by whom (the resolve time is created_at to resolved_at); reopening clears it."""
+def set_ticket_status(ticket_id: int, status: str, by: str | None = None, note: str | None = None) -> dict | None:
+    """Closing records when, by whom and how it was resolved (the resolve time is created_at to resolved_at);
+    reopening clears all three. Closing also ends an escalation."""
     at = now().isoformat()
     with _db() as c:
         if status == "closed":
             c.execute("UPDATE tickets SET status = ?, updated_at = ?, resolved_at = COALESCE(resolved_at, ?), "
-                      "resolved_by = COALESCE(resolved_by, ?) WHERE id = ?", (status, at, at, by, ticket_id))
+                      "resolved_by = COALESCE(resolved_by, ?), resolution_note = COALESCE(?, resolution_note), "
+                      "escalated_at = NULL WHERE id = ?", (status, at, at, by, note, ticket_id))
         else:
-            c.execute("UPDATE tickets SET status = ?, updated_at = ?, resolved_at = NULL, resolved_by = NULL "
-                      "WHERE id = ?", (status, at, ticket_id))
+            c.execute("UPDATE tickets SET status = ?, updated_at = ?, resolved_at = NULL, resolved_by = NULL, "
+                      "resolution_note = NULL WHERE id = ?", (status, at, ticket_id))
+    return get_ticket(ticket_id)
+
+
+def set_ticket_escalation(ticket_id: int, on: bool, reason: str | None) -> dict | None:
+    at = now().isoformat()
+    with _db() as c:
+        c.execute("UPDATE tickets SET escalated_at = ?, escalation_reason = ?, updated_at = ? WHERE id = ?",
+                  (at if on else None, reason if on else None, at, ticket_id))
     return get_ticket(ticket_id)
 
 
@@ -345,6 +440,12 @@ def assign_ticket(ticket_id: int, operator_id: int | None, assignee: str) -> dic
         c.execute("UPDATE tickets SET operator_id = ?, assignee = ?, updated_at = ? WHERE id = ?",
                   (operator_id, assignee, now().isoformat(), ticket_id))
     return get_ticket(ticket_id)
+
+
+def tickets_for_operator(staff_id: int) -> list[dict]:
+    with _db() as c:
+        rows = c.execute("SELECT * FROM tickets WHERE operator_id = ? ORDER BY id", (staff_id,)).fetchall()
+    return [_ticket_view(r) for r in rows]
 
 
 def open_tickets_for_operator(staff_id: int) -> list[dict]:
@@ -685,6 +786,14 @@ def assign_staff(villa_ids: list[str], role: str, staff_id: int | None) -> None:
                 c.execute("INSERT INTO villa_staff (villa_id, role, staff_id) VALUES (?, ?, ?) "
                           "ON CONFLICT(villa_id, role) DO UPDATE SET staff_id = excluded.staff_id",
                           (villa_id, role, staff_id))
+
+
+def villa_managers() -> dict[str, dict]:
+    """{villa_id: {id, name}} for every villa with a manager assigned."""
+    with _db() as c:
+        rows = c.execute("SELECT vs.villa_id, s.id, s.name FROM villa_staff vs JOIN staff s ON s.id = vs.staff_id "
+                         "WHERE vs.role = 'manager'").fetchall()
+    return {r["villa_id"]: {"id": r["id"], "name": r["name"]} for r in rows}
 
 
 def staff_for_villa(villa_id: str) -> dict[str, dict]:
