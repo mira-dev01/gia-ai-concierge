@@ -8,14 +8,14 @@ export const NODE_H = 98;
 
 // Node types on the workflow canvas.
 export const TM = {
-  trigger: { label: 'Trigger', c: '#292725', bg: '#F1EBE6', shape: 'circle' },
-  ai: { label: 'Gia · AI', c: '#B93832', bg: '#F8E9E2', shape: 'circle' },
-  decision: { label: 'Decision', c: '#94600F', bg: '#F6EAD5', shape: 'diamond' },
+  trigger: { label: 'Trigger', c: '#1A1714', bg: '#F1EBE6', shape: 'circle' },
+  ai: { label: 'Gia · AI', c: '#A8382A', bg: '#F9E6DF', shape: 'circle' },
+  decision: { label: 'Decision', c: '#7A4F0C', bg: '#F6EAD5', shape: 'diamond' },
   oi: { label: 'OI system', c: '#4F6475', bg: '#E7ECEF', shape: 'square' },
-  human: { label: 'Human', c: '#292725', bg: '#E9DFD6', shape: 'square' },
+  human: { label: 'Human', c: '#1A1714', bg: '#E9DFD6', shape: 'square' },
   comms: { label: 'WhatsApp', c: '#8A5A44', bg: '#F3E7DF', shape: 'pill' },
-  verify: { label: 'Verification', c: '#53735E', bg: '#E6EEE7', shape: 'diamond' },
-  end: { label: 'Outcome', c: '#292725', bg: '#F1EBE6', shape: 'ring' }
+  verify: { label: 'Verification', c: '#3F5E49', bg: '#E6EEE7', shape: 'diamond' },
+  end: { label: 'Outcome', c: '#1A1714', bg: '#F1EBE6', shape: 'ring' }
 };
 
 // Marker shape per node type: [width, border-radius, transform].
@@ -29,8 +29,8 @@ export const SHAPES = {
 
 // Who did something, for activity feeds.
 export const WHO = {
-  ai: { label: 'AI', bg: '#F8E9E2', fg: '#9E2E29' },
-  human: { label: 'Human', bg: '#292725', fg: '#FFFFFF' },
+  ai: { label: 'AI', bg: '#F9E6DF', fg: '#A8382A' },
+  human: { label: 'Human', bg: '#1A1714', fg: '#FFFFFF' },
   system: { label: 'System', bg: '#E7ECEF', fg: '#3E5263' },
   guest: { label: 'Guest', bg: '#F3E7DF', fg: '#6E4532' }
 };
@@ -186,7 +186,7 @@ export function statusPill(s) {
     'Assigned': ['#E7ECEF', '#3E5263', '◐'],
     'In Progress': ['#F6EAD5', '#6B440B', '◔'],
     'Awaiting Verification': ['#F6EAD5', '#6B440B', '◎'],
-    'Escalated': ['#F6DCD8', '#9E2E29', '▲'],
+    'Escalated': ['#F6DCD8', '#A8382A', '▲'],
     'Resolved': ['#E6EEE7', '#2F4A38', '✓']
   }[s] || ['#F1EBE6', '#6E6762', '·'];
   return { bg: m[0], fg: m[1], icon: m[2] };
@@ -194,7 +194,7 @@ export function statusPill(s) {
 
 export const DEMO_VILLA = { name: 'Villa Serena', loc: 'Assagao Hills, North Goa', code: 'GOA-ASG-01', caps: [['Outdoor deck', 1, ''], ['Celebration decor kit', 1, ''], ['Partner bakery', 1, 'Assagao'], ['In-villa chef', 1, 'On request'], ['Fireworks', 0, 'Not permitted']] };
 
-export const capRows = caps => caps.map(c => ({ k: c[0], glyph: c[1] ? '✓' : '✕', color: c[1] ? '#53735E' : '#B93832', note: c[2] }));
+export const capRows = caps => caps.map(c => ({ k: c[0], glyph: c[1] ? '✓' : '✕', color: c[1] ? '#53735E' : '#C2412E', note: c[2] }));
 
 // The demo guest. cCur is the concierge step index; her stage and arrival depend on it.
 export function demoBooking(cCur) {
@@ -273,10 +273,10 @@ export function scenarioTickets(cS, cCur, fS, fCur) {
   return out;
 }
 
-const SEVERITY = { High: ['#9E2E29', '▲'], Medium: ['#94600F', '◆'], Low: ['#6E6762', '·'], Normal: ['#6E6762', '·'] };
-const CHECK_STATE = { ok: ['✓', '#53735E', 'Done'], rejected: ['✕', '#B93832', 'Rejected'], submitted: ['◎', '#94600F', 'Checking'], pending: ['○', '#9A918A', 'To do'] };
-const REVIEW_TONE = { green: ['#E6EEE7', '#2F4A38', '#C9D9CC'], red: ['#FBEDEA', '#9E2E29', '#F0CFC9'], amber: ['#FBF3E4', '#6B440B', '#EFDDBA'], dark: ['#F1EBE6', '#292725', '#D9CCC1'], neutral: ['#F8F3EF', '#292725', '#E8DDD4'] };
-export const EVIDENCE_RESULT = { Checking: ['#F6EAD5', '#6B440B'], Rejected: ['#F6DCD8', '#9E2E29'], Accepted: ['#E6EEE7', '#2F4A38'] };
+const SEVERITY = { High: ['#A8382A', '▲'], Medium: ['#7A4F0C', '◆'], Low: ['#6E6762', '·'], Normal: ['#6E6762', '·'] };
+const CHECK_STATE = { ok: ['✓', '#53735E', 'Done'], rejected: ['✕', '#C2412E', 'Rejected'], submitted: ['◎', '#7A4F0C', 'Checking'], pending: ['○', '#6A625C', 'To do'] };
+const REVIEW_TONE = { green: ['#E6EEE7', '#2F4A38', '#C9D9CC'], red: ['#FBEDEA', '#A8382A', '#F0CFC9'], amber: ['#FBF3E4', '#6B440B', '#EFDDBA'], dark: ['#F1EBE6', '#1A1714', '#D9CCC1'], neutral: ['#F5F0E8', '#1A1714', '#E8DDD4'] };
+export const EVIDENCE_RESULT = { Checking: ['#F6EAD5', '#6B440B'], Rejected: ['#F6DCD8', '#A8382A'], Accepted: ['#E6EEE7', '#2F4A38'] };
 
 // Adds everything the ticket views need to draw a ticket: colours, glyphs, progress bars.
 export function decorateTicket(t) {
@@ -293,19 +293,19 @@ export function decorateTicket(t) {
     : null);
   return Object.assign({}, t, {
     pill: statusPill(t.status), sevColor: sev[0], sevGlyph: sev[1], ownerShort: t.owner.split(' · ')[0],
-    flowItems: list.map((x, i) => ({ label: x === 'Awaiting Verification' ? 'Verify' : x, bg: i <= idx ? (x === 'Escalated' ? '#B93832' : i === idx ? '#292725' : '#53735E') : '#E8DDD4', fg: i <= idx ? '#292725' : '#9A918A' })),
+    flowItems: list.map((x, i) => ({ label: x === 'Awaiting Verification' ? 'Verify' : x, bg: i <= idx ? (x === 'Escalated' ? '#C2412E' : i === idx ? '#1A1714' : '#53735E') : '#E8DDD4', fg: i <= idx ? '#1A1714' : '#6A625C' })),
     checklist: t.checklist.map(c => ({ label: c.label, glyph: CHECK_STATE[c.state][0], color: CHECK_STATE[c.state][1], stateLabel: CHECK_STATE[c.state][2] })),
-    closure: t.closure.map(c => ({ label: c[0], glyph: c[1] ? '✓' : '○', color: c[1] ? '#53735E' : '#9A918A' })),
+    closure: t.closure.map(c => ({ label: c[0], glyph: c[1] ? '✓' : '○', color: c[1] ? '#53735E' : '#6A625C' })),
     attempts: t.attempts.map(a => {
       const R = EVIDENCE_RESULT[a.result];
       const chk = a.result === 'Checking';
       return {
         n: a.n, time: a.time, result: a.result, bg: R[0], fg: R[1],
-        items: a.items.map(it => ({ label: it.label, ph: it.ph, glyph: chk ? '…' : it.ok ? '✓' : '✕', badgeBg: chk ? '#94600F' : it.ok ? '#53735E' : '#B93832', border: chk || it.ok ? '#E8DDD4' : '#E9B7B0', why: it.why || '', hasWhy: !chk && !it.ok }))
+        items: a.items.map(it => ({ label: it.label, ph: it.ph, glyph: chk ? '…' : it.ok ? '✓' : '✕', badgeBg: chk ? '#7A4F0C' : it.ok ? '#53735E' : '#C2412E', border: chk || it.ok ? '#E8DDD4' : '#E9B7B0', why: it.why || '', hasWhy: !chk && !it.ok }))
       };
     }),
     review: { title: t.review.title, text: t.review.text, simulated: t.review.simulated, bg: RT[0], fg: RT[1], border: RT[2] },
-    tracker: tr && tr.map(k => ({ label: k[0], glyph: k[1] ? '✓' : '○', fg: k[1] ? '#2F4A38' : '#9A918A', bg: k[1] ? '#E6EEE7' : '#FFFFFF', border: k[1] ? '#C9D9CC' : '#E8DDD4' })),
+    tracker: tr && tr.map(k => ({ label: k[0], glyph: k[1] ? '✓' : '○', fg: k[1] ? '#2F4A38' : '#6A625C', bg: k[1] ? '#E6EEE7' : '#FFFFFF', border: k[1] ? '#C9D9CC' : '#E8DDD4' })),
     humanReason: t.humanReason || '',
     scenario: !!t.scenario, history: t.history || []
   });

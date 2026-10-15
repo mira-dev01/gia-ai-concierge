@@ -20,18 +20,21 @@ const AUTO_STEP_MS = 1300;     // pause between the steps a phone action trigger
 const PLAY_STEP_MS = 1700;     // pause between steps when the workflow is playing
 const MIN_ZOOM = 0.3, MAX_ZOOM = 1.8;
 const ALL = 'all';
+const VIEW_LABEL = { overview: 'Overview', guests: 'Guest journeys', field: 'Operations', workflows: 'Workflows' };
+const ATTENTION_SHOWN = 5;     // Overview lists this many items needing attention before "View all"
+const ACTIVITY_SHOWN = 6;
 
 const ownerName = owner => owner.split(' · ')[0];
 const stepsFor = (wf, s) => wf === 'concierge' ? D.conciergeSteps(s.cBranch) : D.fieldSteps(s.fBranch);
 const stepKey = wf => wf === 'concierge' ? 'cStep' : 'fStep';
-const STAGE_COLORS = { 'In stay': ['#F8E9E2', '#9E2E29'], 'Pre-arrival': ['#E7ECEF', '#3E5263'], 'Post-stay': ['#F1EBE6', '#6E6762'], 'Cancelled': ['#F1EBE6', '#9A918A'] };
+const STAGE_COLORS = { 'In stay': ['#F9E6DF', '#A8382A'], 'Pre-arrival': ['#E7ECEF', '#3E5263'], 'Post-stay': ['#F1EBE6', '#6E6762'], 'Cancelled': ['#F1EBE6', '#6A625C'] };
 const EMPTY_LIVE = { now: '', bookings: [], tickets: [], handoffs: [], events: [], villas: [], ticket_statuses: [], operators: [], operator_roles: [] };
 const EMPTY_FORM = { name: '', phone: '', role: 'caretaker', villa_ids: [], presence: 'onsite' };
 const TOAST_MS = 8000, URGENT_TOAST_MS = 15000;
 // Live activity badges: [label, text colour, background].
 const EVENT_KINDS = {
-  ticket: ['Ticket', '#3E5263', '#E7ECEF'], handoff: ['Person', '#9E2E29', '#F6DCD8'], resolved: ['Resolved', '#2F4A38', '#E6EEE7'],
-  delayed: ['Late', '#9E2E29', '#F6DCD8'], flag: ['Flag', '#9E2E29', '#F6DCD8'], operator: ['Operator', '#6E4532', '#F3E7DF'],
+  ticket: ['Ticket', '#3E5263', '#E7ECEF'], handoff: ['Person', '#A8382A', '#F6DCD8'], resolved: ['Resolved', '#2F4A38', '#E6EEE7'],
+  delayed: ['Late', '#A8382A', '#F6DCD8'], flag: ['Flag', '#A8382A', '#F6DCD8'], operator: ['Operator', '#6E4532', '#F3E7DF'],
   journey: ['Journey', '#8A5A44', '#F3E7DF'], profile: ['Guest', '#2F4A38', '#E6EEE7'], booking: ['Booking', '#3E5263', '#E7ECEF']
 };
 
@@ -46,12 +49,13 @@ class OpsConsole extends React.Component {
   initialState(useSaved) {
     const d = {
       view: 'overview', cStep: 8, fStep: 6, cBranch: 'yes', fBranch: 'accept', booking: null, gTab: 'tickets', gTicket: null,
-      fTicket: null, fOperator: null, fVilla: ALL, fCat: ALL, fOp: ALL, fStatus: ALL,
+      fTicket: null, fOperator: null, fVilla: ALL, fCat: ALL, fOp: ALL, fStatus: 'active', fMore: false,
+      ovVilla: ALL, ovAll: false, ovActivity: false,
       wf: 'concierge', sel: null, search: '', z: 0.75, px: 30, py: 30, playing: false, cap: {},
       demoTakeover: false, demoOps: [], draft: '', opDraft: '', adding: false, opForm: EMPTY_FORM, eventToasts: [],
       moved: { concierge: false, field: false },
       pos: { concierge: D.defaultPositions('concierge'), field: D.defaultPositions('field') },
-      live: null, liveError: null, pending: {}, notice: null
+      live: null, liveError: null, pending: {}, notice: null, back: null
     };
     if (useSaved) {
       try {
@@ -170,7 +174,11 @@ class OpsConsole extends React.Component {
     }
   }
 
+  // Acting on a ticket keeps it selected, so its outcome stays in view even if it no longer leads the list.
+  pin(t) { if (this.state.fTicket !== t.ref) this.setState({ fTicket: t.ref, fOperator: null }); }
+
   setTicketStatus(t, status) {
+    this.pin(t);
     this.acted.set(t.ref, Date.now());
     return this.act('ticket:' + t.id, () => L.api('POST', `/tickets/${t.id}/status`, { status }),
       r => `${r.ref} is now ${L.STATUS_LABEL[r.status].toLowerCase()}` + (r.guest_messaged ? '. Gia messaged the guest on WhatsApp.' : '. Internal ticket, so the guest wasn’t messaged.'));
@@ -195,12 +203,14 @@ class OpsConsole extends React.Component {
 
   markDone(t) {
     if (t.notifies_guest && !window.confirm(`Mark ${t.ref} done for ${t.operator}? Gia will tell ${t.guest || 'the guest'} it’s done.`)) return;
+    this.pin(t);
     this.acted.set(t.ref, Date.now());
     return this.act('done:' + t.id, () => L.api('POST', `/tickets/${t.id}/done`),
       r => `${r.ref} done · resolved in ${L.duration(r.minutes)}` + (r.guest_messaged ? '. Gia told the guest.' : '.'));
   }
 
   assignTicket(t, operatorId) {
+    this.pin(t);
     this.acted.set(t.ref, Date.now());
     return this.act('assign:' + t.id, () => L.api('POST', `/tickets/${t.id}/assign`, { operator_id: operatorId }),
       r => `${t.ref} → ${r.assignee}` + (operatorId ? '. They’ve been sent the task on WhatsApp.' : '.'));
@@ -301,7 +311,9 @@ class OpsConsole extends React.Component {
   startPlay() {
     this.stopPlay();
     this.clearTimers();
-    this.setState({ playing: true, sel: null });
+    const key = stepKey(this.state.wf);
+    const atEnd = this.state[key] >= stepsFor(this.state.wf, this.state).length - 1;
+    this.setState({ playing: true, sel: null, ...(atEnd ? { [key]: 0 } : {}) });
     this.playTimer = setInterval(() => {
       const s = this.state, key = stepKey(s.wf);
       if (s[key] >= stepsFor(s.wf, s).length - 1) { this.stopPlay(); return; }
@@ -321,7 +333,8 @@ class OpsConsole extends React.Component {
     this.clearTimers();
     this.stopPlay();
     const d = this.initialState(false);
-    const keep = ['view', 'booking', 'fTicket', 'fOperator', 'gTab', 'gTicket', 'fVilla', 'fCat', 'fOp', 'fStatus', 'search', 'draft',
+    const keep = ['view', 'booking', 'fTicket', 'fOperator', 'gTab', 'gTicket', 'fVilla', 'fCat', 'fOp', 'fStatus', 'fMore', 'search', 'draft',
+      'ovVilla', 'ovAll', 'ovActivity',
       'opDraft', 'adding', 'opForm', 'eventToasts', 'live', 'liveError', 'pending', 'notice'];
     keep.forEach(k => { d[k] = this.state[k]; });
     this.needFit = true;
@@ -334,10 +347,16 @@ class OpsConsole extends React.Component {
   viewModel() {
     const s = this.state;
     const live = s.live || EMPTY_LIVE, now = live.now, loaded = !!s.live;
+    // Following a link from one screen to another remembers the screen you came from, so you can go back to it.
     const go = (view, extra) => {
       this.stopPlay();
       if (view === 'workflows') this.needFit = true;
-      this.setState({ view, ...(extra || {}) });
+      this.setState(st => ({ view, back: view !== st.view ? st.view : st.back, ...(extra || {}) }));
+    };
+    const navTo = view => {
+      this.stopPlay();
+      if (view === 'workflows') this.needFit = true;
+      this.setState({ view, back: null });
     };
     const toFlow = wf => go('workflows', { wf, sel: null });
 
@@ -358,47 +377,53 @@ class OpsConsole extends React.Component {
     const openCount = id => live.tickets.filter(t => t.booking_id === id && t.status !== 'closed').length;
     const openText = n => n ? n + ' open ticket' + (n > 1 ? 's' : '') : 'No open tickets';
     const attention = L.attention(live).map(a => ({
-      ...a, go: a.kind === 'handoff' ? () => go('guests', { booking: a.booking }) : () => go('field', { fTicket: a.ref })
+      ...a, go: a.kind === 'handoff' ? () => go('guests', { booking: a.booking }) : () => go('field', { fTicket: a.ref, fOperator: null })
     }));
     const waitingHandoffs = live.handoffs.filter(x => x.status === 'waiting');
     const ticketAlerts = attention.filter(a => a.kind === 'ticket').length;
 
     const nav = [['overview', 'Overview'], ['guests', 'Guest Journeys'], ['field', 'Operations'], ['workflows', 'Workflows']].map(([id, label]) => ({
       id, label: label, on: s.view === id, diamond: id === 'workflows',
-      badge: id === 'guests' ? waitingHandoffs.length : id === 'field' ? ticketAlerts : 0, go: () => go(id)
+      badge: id === 'guests' ? waitingHandoffs.length : id === 'field' ? ticketAlerts : 0, go: () => navTo(id)
     }));
 
     const sync = { loaded, error: s.liveError, at: now ? now.slice(11, 19) : '' };
 
-    // ---- overview ----
-    const inStay = bookings.filter(b => b.stage === 'In stay');
-    const open = live.tickets.filter(t => t.status !== 'closed');
+    // ---- overview: what needs a person first, then who's here, then what happened ----
+    const inVilla = name => s.ovVilla === ALL || name === s.ovVilla;
+    const ovAttention = attention.filter(a => inVilla(a.villa));
+    const inStay = bookings.filter(b => b.stage === 'In stay' && inVilla(b.villa));
+    const open = live.tickets.filter(t => t.status !== 'closed' && inVilla(t.villa));
     const late = open.filter(t => t.overdue);
-    const villasInUse = new Set(inStay.map(b => b.villa_id)).size;
     const ov = {
-      date: now ? L.longDate(now) : 'Guest operations',
-      stats: [
-        { label: 'Active stays', value: inStay.length, note: villasInUse ? `Across ${villasInUse} villa${villasInUse > 1 ? 's' : ''}` : 'No guests in villas today', color: '#292725', go: () => go('guests') },
-        { label: 'Open tickets', value: open.length, note: 'Every request is in OI', color: '#292725', go: () => go('field', { fStatus: ALL }) },
-        { label: 'Past expected time', value: late.length, note: 'Open beyond their SLA', color: '#94600F', go: () => go('field', { fStatus: 'overdue' }) },
-        { label: 'Needs a person', value: attention.length, note: 'Handoffs, delays and urgent issues', color: '#B93832', go: attention.length ? attention[0].go : () => go('field') }
-      ].map(st => ({ ...st, value: loaded ? st.value : '–' })),
-      attention, loaded,
-      conversations: bookings.filter(b => b.in_conversation).map(b => ({
-        key: b.id, initials: L.initials(b.name), title: `${b.takeover ? 'Ops is' : 'Gia is'} in conversation with ${b.name}`,
-        text: `${b.villa} · last message ${L.ago(b.last_inbound_at, now)}`, go: () => go('guests', { booking: b.id })
+      date: now ? L.longDate(now) : '', loaded,
+      villa: { value: s.ovVilla, options: [[ALL, 'All villas']].concat(live.villas.map(v => [v.name, v.name])), onChange: e => this.setState({ ovVilla: e.target.value, ovAll: false }) },
+      metrics: [
+        { key: 'attn', label: 'need attention', value: ovAttention.length, tone: ovAttention.length ? 'red' : '', go: () => this.setState({ ovAll: true }) },
+        { key: 'late', label: 'overdue', value: late.length, tone: late.length ? 'red' : '', go: () => go('field', { fStatus: 'overdue', fVilla: s.ovVilla }) },
+        { key: 'open', label: 'open tickets', value: open.length, go: () => go('field', { fStatus: 'active', fVilla: s.ovVilla }) },
+        { key: 'stay', label: 'in stay', value: inStay.length, go: () => go('guests') }
+      ].map(m => ({ ...m, value: loaded ? m.value : '–' })),
+      attention: (s.ovAll ? ovAttention : ovAttention.slice(0, ATTENTION_SHOWN)).map((a, i) => ({ ...a, primary: i === 0 })),
+      more: !s.ovAll && ovAttention.length > ATTENTION_SHOWN ? { text: `View all ${ovAttention.length}`, go: () => this.setState({ ovAll: true }) } : null,
+      conversations: bookings.filter(b => b.in_conversation && inVilla(b.villa)).map(b => ({
+        key: b.id, initials: L.initials(b.name), title: b.name, text: `${b.takeover ? 'Ops is replying' : 'Gia is replying'} · ${L.ago(b.last_inbound_at, now)}`,
+        go: () => go('guests', { booking: b.id })
       })),
-      events: live.events.slice(0, 12).map(e => this.eventView(e, now, go)),
-      stays: bookings.filter(b => b.stage === 'In stay' || b.stage === 'Pre-arrival').map(b => ({
-        key: b.id, name: b.name, villa: b.villa, dates: L.dateRange(b.check_in, b.check_out) + ' · ' + b.stage,
-        initials: L.initials(b.name), openText: openText(openCount(b.id)), go: () => go('guests', { booking: b.id })
+      stays: bookings.filter(b => (b.stage === 'In stay' || b.stage === 'Pre-arrival') && inVilla(b.villa)).map(b => ({
+        key: b.id, name: b.name, initials: L.initials(b.name), sub: `${b.villa} · ${L.dateRange(b.check_in, b.check_out)}`, stage: b.stage,
+        open: openCount(b.id), go: () => go('guests', { booking: b.id })
       })),
-      operators: live.operators.slice().sort((a, b) => b.open - a.open || a.name.localeCompare(b.name)).map(op => ({
-        key: op.id, name: op.name, initials: L.initials(op.name), presence: op.presence, roles: L.roleSummary(op),
-        openText: op.open ? `${op.open} open` : 'No open tasks',
-        avg: op.avg_resolve_minutes !== null ? `avg ${L.duration(op.avg_resolve_minutes)}` : '',
-        go: () => go('field', { fOperator: op.id, fTicket: null })
-      })),
+      operators: live.operators.filter(op => s.ovVilla === ALL || op.roles.some(r => r.villa === s.ovVilla))
+        .slice().sort((a, b) => b.open - a.open || a.name.localeCompare(b.name)).map(op => ({
+          key: op.id, name: op.name, initials: L.initials(op.name), presence: op.presence, open: op.open,
+          go: () => go('field', { fOperator: op.id, fTicket: null, fStatus: ALL })
+        })),
+      activity: (() => {
+        const list = live.events.filter(e => s.ovVilla === ALL || !e.ticket || (ticketByRef[e.ticket] && ticketByRef[e.ticket].villa === s.ovVilla));
+        return { items: (s.ovActivity ? list.slice(0, 30) : list.slice(0, ACTIVITY_SHOWN)).map(e => this.eventView(e, now, go)),
+          more: !s.ovActivity && list.length > ACTIVITY_SHOWN ? () => this.setState({ ovActivity: true }) : null };
+      })(),
       addOperator: () => go('field', { adding: true })
     };
 
@@ -407,8 +432,9 @@ class OpsConsole extends React.Component {
     const selBookingId = s.booking === DEMO || bookings.some(b => b.id === s.booking) ? s.booking : (bookings[0] ? bookings[0].id : DEMO);
     const demoOpen = demoTickets.filter(t => t.booking === 'demo' && t.status !== 'Resolved').length;
     const matches = (...fields) => !q || fields.join(' ').toLowerCase().includes(q);
+    const waitingFor = new Set(waitingHandoffs.map(x => x.booking_id));
     const listRow = (key, name, villa, dates, stage, id, open, demo) => ({
-      key, name, villa, dates, stage, id, openText: openText(open), demo, on: key === selBookingId,
+      key, name, villa, dates, stage, id, openText: openText(open), demo, on: key === selBookingId, waiting: waitingFor.has(key),
       stBg: STAGE_COLORS[stage][0], stFg: STAGE_COLORS[stage][1], go: () => this.setState({ booking: key, gTicket: null })
     });
     const gjList = bookings.filter(b => matches(b.name, b.villa, b.id))
@@ -425,10 +451,17 @@ class OpsConsole extends React.Component {
     // ---- operations: live tickets grouped by field operator, then unassigned, then the demo tickets ----
     const distinct = vals => Array.from(new Set(vals)).sort();
     const opById = Object.fromEntries(live.operators.map(o => [o.id, o]));
-    const filtered = tickets.filter(t =>
+    // Quick views over the ticket list; a specific status can still be picked under "More filters".
+    const VIEWS = [
+      ['active', 'Open', t => t.statusKey !== 'closed'], ['overdue', 'Overdue', t => t.overdue],
+      ['unassigned', 'Unassigned', t => !t.operator_id && t.statusKey !== 'closed'], ['closed', 'Closed', t => t.statusKey === 'closed'],
+      [ALL, 'All', () => true]
+    ];
+    const viewFn = (VIEWS.find(v => v[0] === s.fStatus) || [null, null, t => t.statusKey === s.fStatus])[2];
+    const base = tickets.filter(t =>
       (s.fVilla === ALL || t.villa === s.fVilla) && (s.fCat === ALL || t.category === s.fCat) &&
-      (s.fOp === ALL || (s.fOp === 'none' ? !t.operator_id : String(t.operator_id) === s.fOp)) &&
-      (s.fStatus === ALL || (s.fStatus === 'overdue' ? t.overdue : t.statusKey === s.fStatus)));
+      (s.fOp === ALL || (s.fOp === 'none' ? !t.operator_id : String(t.operator_id) === s.fOp)));
+    const filtered = base.filter(viewFn);
     const narrowed = s.fVilla !== ALL || s.fCat !== ALL || s.fStatus !== ALL;
     // Open work first (newest first), then what's done (most recently resolved first).
     const order = list => list.slice().sort((a, b) => (a.statusKey === 'closed') - (b.statusKey === 'closed') ||
@@ -441,7 +474,8 @@ class OpsConsole extends React.Component {
     const unassigned = s.fOp === ALL || s.fOp === 'none' ? order(filtered.filter(t => !t.operator_id)) : [];
     const demoRows = demoTickets.map(t => D.decorateTicket(t));
     const picked = ticketByRef[s.fTicket] || demoRows.find(t => t.id === s.fTicket);
-    const firstTicket = (groups.find(g => g.tickets.length) || { tickets: [] }).tickets[0] || unassigned[0];
+    const urgentRef = (attention.find(a => a.kind === 'ticket' && filtered.some(t => t.ref === a.ref)) || {}).ref;
+    const firstTicket = ticketByRef[urgentRef] || unassigned[0] || (groups.find(g => g.tickets.length) || { tickets: [] }).tickets[0];
     const selTicket = picked || (s.fOperator == null ? firstTicket || null : null);
     // The phone follows the selected ticket's current operator (so a reassignment switches it), else the chosen operator.
     const selOp = selTicket ? (selTicket.ref && opById[selTicket.operator_id]) || null : opById[s.fOperator] || (groups[0] ? groups[0].op : null);
@@ -451,19 +485,24 @@ class OpsConsole extends React.Component {
       key, title, sub, rows, op: op ? { presence: op.presence, open: op.open, avg: op.avg_resolve_minutes !== null ? 'avg ' + L.duration(op.avg_resolve_minutes) : '' } : null,
       on: !!op && op.id === selOpId && !selTicket, go: op ? () => this.setState({ fOperator: op.id, fTicket: null }) : null
     });
+    const extraFilters = [s.fVilla, s.fCat, s.fOp].filter(v => v !== ALL).length + (VIEWS.some(v => v[0] === s.fStatus) ? 0 : 1);
     const fo = {
       loaded, hasLive: tickets.length > 0 || live.operators.length > 0,
+      views: VIEWS.map(([key, label, fn]) => ({ key, label, count: base.filter(fn).length, on: s.fStatus === key,
+        alert: (key === 'overdue' || key === 'unassigned') && base.filter(fn).length > 0, go: () => this.setState({ fStatus: key }) })),
+      moreOpen: s.fMore || extraFilters > 0, toggleMore: () => this.setState({ fMore: !(s.fMore || extraFilters > 0) }),
+      extraCount: extraFilters,
       filters: [
         { key: 'fVilla', aria: 'Villa', options: [[ALL, 'All villas']].concat(live.villas.map(v => [v.name, v.name])) },
         { key: 'fCat', aria: 'Category', options: [[ALL, 'All categories']].concat(distinct(live.tickets.map(t => t.category)).map(c => [c, L.titleCase(c)])) },
         { key: 'fOp', aria: 'Operator', options: [[ALL, 'All operators']].concat(live.operators.map(o => [String(o.id), o.name]), [['none', 'Unassigned']]) },
-        { key: 'fStatus', aria: 'Status', options: [[ALL, 'All statuses']].concat(live.ticket_statuses.map(st => [st, L.STATUS_LABEL[st] || L.titleCase(st)]), [['overdue', 'Past expected time']]) }
-      ].map(f => ({ ...f, value: f.options.some(o => o[0] === s[f.key]) ? s[f.key] : ALL, onChange: e => this.setState({ [f.key]: e.target.value }) })),
-      countText: `${filtered.length} of ${tickets.length} live tickets · ${live.operators.length} operator${live.operators.length === 1 ? '' : 's'}`,
-      isFiltered: s.fVilla !== ALL || s.fCat !== ALL || s.fOp !== ALL || s.fStatus !== ALL,
-      clear: () => this.setState({ fVilla: ALL, fCat: ALL, fOp: ALL, fStatus: ALL }),
-      groups: groups.map(g => opGroup('op' + g.op.id, g.op.name, L.roleSummary(g.op), g.op, g.tickets.map(t => this.taskRow(t, t.ref, selRef))))
-        .concat(unassigned.length ? [opGroup('none', 'Unassigned', 'Ops control tower · assign an operator', null, unassigned.map(t => this.taskRow(t, t.ref, selRef)))] : []),
+        { key: 'fStatus', aria: 'Exact status', options: [['', 'Exact status: any']].concat(live.ticket_statuses.map(st => [st, L.STATUS_LABEL[st] || L.titleCase(st)])) }
+      ].map(f => ({ ...f, value: f.options.some(o => o[0] === s[f.key]) ? s[f.key] : f.options[0][0],
+        onChange: e => this.setState({ [f.key]: f.key === 'fStatus' && !e.target.value ? 'active' : e.target.value }) })),
+      isFiltered: extraFilters > 0,
+      clear: () => this.setState({ fVilla: ALL, fCat: ALL, fOp: ALL, fStatus: 'active' }),
+      groups: (unassigned.length ? [opGroup('none', 'Unassigned', 'Needs an operator', null, unassigned.map(t => this.taskRow(t, t.ref, selRef)))] : [])
+        .concat(groups.map(g => opGroup('op' + g.op.id, g.op.name, L.roleSummary(g.op), g.op, g.tickets.map(t => this.taskRow(t, t.ref, selRef))))),
       demoRows: demoRows.map(t => this.taskRow(t, t.id, selRef)),
       t: !selTicket ? null : selTicket.ref ? this.liveTicketDetail(selTicket, live, go) : { ...selTicket, live: false },
       opDetail: !selTicket && selOp ? this.operatorDetail(selOp) : null,
@@ -479,7 +518,7 @@ class OpsConsole extends React.Component {
       const on = !!s.cap[key];
       return {
         key, label, on, icon: on ? '' : '+',
-        thumb: on ? 'repeating-linear-gradient(135deg,#E3D6CB 0 6px,#D9CABD 6px 12px)' : '#F8F3EF',
+        thumb: on ? 'repeating-linear-gradient(135deg,#E3D6CB 0 6px,#D9CABD 6px 12px)' : '#F5F0E8',
         border: `1px ${on ? 'solid' : 'dashed'} ${on ? '#53735E' : '#C9BBAE'}`,
         tap: () => this.setState(st => ({ cap: { ...st.cap, [key]: !st.cap[key] } }))
       };
@@ -490,7 +529,7 @@ class OpsConsole extends React.Component {
     const escalating = s.fBranch === 'escalate';
     const opPhone = !isScenario && selOp ? this.operatorPhone(selOp, tickets, now) : null;
     const ph = {
-      op: opPhone,
+      show: !!opPhone || isScenario, op: opPhone,
       who: isScenario ? 'Santosh Naik · Maintenance' : opPhone ? opPhone.name : selTicket ? ownerName(selTicket.owner || '') : '',
       hint: isScenario || opPhone ? null
         : selTicket && !selTicket.ref ? h`Select <b>${DEMO_FIELD_TICKET}</b> to walk through the field evidence flow.`
@@ -521,6 +560,7 @@ class OpsConsole extends React.Component {
 
     return {
       view: s.view, nav, sync, notice: s.notice, dismissNotice: () => this.setState({ notice: null }),
+      back: s.back && s.back !== s.view ? { label: VIEW_LABEL[s.back], go: () => { if (s.back === 'workflows') this.needFit = true; this.setState({ view: s.back, back: null }); } } : null,
       toasts: s.eventToasts.map(e => ({ ...this.eventView(e, now, go), dismiss: () => this.dismissEvent(e.id) })),
       resetDemo: () => this.resetDemo(), ov, gj, fo, ph, wv, pd, phoneRef: this.phoneRef
     };
@@ -587,32 +627,37 @@ class OpsConsole extends React.Component {
     };
   }
 
+  // The selected ticket, arranged around its next step: assign it if no one has it, otherwise the status change that
+  // usually comes next (the others stay one click away). Nothing here changes a ticket by itself.
   liveTicketDetail(t, live, go) {
     const pending = !!this.state.pending['ticket:' + t.id];
+    const closed = t.statusKey === 'closed', unassigned = !t.operator_id;
+    const NEXT = { open: 'acknowledged', acknowledged: 'in_progress', in_progress: 'closed', delayed: 'closed' };
+    const VERB = { acknowledged: 'Acknowledge', in_progress: 'Mark in progress', delayed: 'Mark delayed', closed: 'Resolve' };
+    const next = closed || unassigned ? null : NEXT[t.statusKey];
+    const op = live.operators.find(o => o.id === t.operator_id);
     return {
       live: true, id: t.ref, villa: t.villa, cat: t.cat, title: t.title, status: t.status, pill: t.pill,
-      facts: [
-        { k: 'Severity', v: `${t.sevGlyph} ${t.sev}`, color: t.sevColor, strong: true },
-        { k: 'Source', v: t.origin },
-        { k: 'Opened', v: L.whenFull(t.created_at, live.now) },
-        { k: 'Expected by', v: t.due + (t.overdue ? ' · late' : ''), color: t.overdue ? '#B93832' : undefined, strong: t.overdue },
-        { k: 'Updated', v: t.updated }
-      ],
-      flag: t.timeFlag, resolvedText: t.resolvedText,
-      operator: {
+      sev: t.sev, sevColor: t.sevColor, sevGlyph: t.sevGlyph, flag: t.timeFlag,
+      overdue: t.overdue && !closed ? `Overdue · was due ${t.due}` : '',
+      closed, unassigned, resolvedText: t.resolvedText,
+      assign: {
         value: t.operator_id ? String(t.operator_id) : '',
-        options: [['', 'Ops control tower (unassigned)']].concat(live.operators.map(o => [String(o.id), `${o.name} · ${o.presence}`])),
+        options: [['', unassigned ? 'Choose an operator…' : 'Unassign (back to control tower)']].concat(live.operators.map(o => [String(o.id), `${o.name} · ${o.presence}${o.open ? ` · ${o.open} open` : ''}`])),
         onChange: e => this.assignTicket(t, e.target.value ? Number(e.target.value) : null),
-        pending: !!this.state.pending['assign:' + t.id]
+        pending: !!this.state.pending['assign:' + t.id], hasOperators: live.operators.length > 0,
+        addOperator: () => this.setState({ adding: true }),
+        current: op ? `${op.name} · ${op.presence}` : t.owner
       },
-      flowItems: t.flowItems,
-      closed: t.statusKey === 'closed',
-      actions: live.ticket_statuses.filter(st => st !== 'open' && st !== t.statusKey).map(st => ({
-        key: st, label: L.STATUS_LABEL[st] || L.titleCase(st), pending, go: () => this.setStatusConfirmed(t, st)
-      })),
-      notifyText: t.notifies_guest ? `Gia messages ${t.guest || 'the guest'} on WhatsApp with each change.` : 'Internal ticket: the guest isn’t messaged.',
-      issue: t.details, reporter: [t.guest, t.booking_id].filter(Boolean).join(' · '),
-      history: t.history,
+      primary: next ? { label: VERB[next], go: () => this.setStatusConfirmed(t, next), pending } : null,
+      secondary: closed ? [] : live.ticket_statuses.filter(st => st !== 'open' && st !== t.statusKey && st !== next)
+        .map(st => ({ key: st, label: VERB[st] || L.titleCase(st), pending, go: () => this.setStatusConfirmed(t, st) })),
+      notifyText: t.notifies_guest ? `${t.guest || 'The guest'} is updated on WhatsApp at each step.` : 'Internal ticket · the guest isn’t messaged.',
+      issue: t.details, requestLabel: t.notifies_guest ? 'Guest request' : 'Details',
+      reporter: [t.guest, t.booking_id].filter(Boolean).join(' · '),
+      details: [['Source', t.origin], ['Opened', L.whenFull(t.created_at, live.now)], ['Expected by', t.due], ['Updated', t.updated],
+        ['Assigned to', t.owner]],
+      flowItems: t.flowItems, history: t.history,
       openJourney: t.booking_id ? () => go('guests', { booking: t.booking_id, gTab: 'tickets', gTicket: t.ref }) : null
     };
   }
@@ -633,7 +678,8 @@ class OpsConsole extends React.Component {
     if (!staffRows.length && b.host) staffRows.push(['Villa host', b.host]);
     return {
       demo: false,
-      b: { id: b.id, name: b.name, initials: L.initials(b.name), sub: `WhatsApp · ${L.phoneLabel(b.phone)} · ${b.villa}` },
+      b: { id: b.id, name: b.name, initials: L.initials(b.name), stage: b.stage,
+        sub: `${b.villa} · ${L.dateRange(b.check_in, b.check_out)} · ${L.phoneLabel(b.phone)}` },
       chat: L.chatItems(b, live.tickets.filter(t => t.booking_id === b.id), now, ref => this.setState({ gTab: 'tickets', gTicket: ref })),
       sc: null,
       takeover: b.takeover, takeoverPending: !!s.pending['takeover:' + b.id],
@@ -657,18 +703,19 @@ class OpsConsole extends React.Component {
           ...staffRows.map(([k, v]) => ({ k, v }))
         ],
         noArrival: !Object.keys(b.details || {}).length,
-        prefs: b.preferences.map(p => ({ label: p.preference, title: `${L.titleCase(p.category)} · “${p.source_quote}”`, bg: sameDay(p.at) ? '#E6EEE7' : '#F8F3EF', border: sameDay(p.at) ? '#C9D9CC' : '#EDE4DC' })),
+        prefs: b.preferences.map(p => ({ label: p.preference, title: `${L.titleCase(p.category)} · “${p.source_quote}”`, bg: sameDay(p.at) ? '#E6EEE7' : '#F5F0E8', border: sameDay(p.at) ? '#C9D9CC' : '#EDE4DC' })),
         journey: L.journeyRows(b, now),
-        caps: villa.caps.map(c => ({ k: c.label, glyph: c.ok ? '✓' : '✕', color: c.ok ? '#53735E' : '#B93832', note: c.note }))
+        caps: villa.caps.map(c => ({ k: c.label, glyph: c.ok ? '✓' : '✕', color: c.ok ? '#53735E' : '#C2412E', note: c.note }))
       },
-      tickets: bT.map(t => ({ id: t.ref, cat: t.cat, title: t.title, status: t.status, pill: t.pill, on: gSel && t.ref === gSel.ref, go: () => this.setState({ gTicket: t.ref }) })),
+      tickets: bT.map(t => ({ id: t.ref, cat: t.cat, title: t.title, status: t.status, pill: t.pill, flag: t.timeFlag, on: gSel && t.ref === gSel.ref, go: () => this.setState({ gTicket: t.ref }) })),
       t: gSel ? {
-        title: gSel.title, flowItems: gSel.flowItems, history: gSel.history,
-        rows: [['Owner', gSel.owner], ['Priority', gSel.sev], ['Source', gSel.origin], ['Expected by', gSel.due + (gSel.overdue ? ' · late' : '')]]
+        title: gSel.title, status: gSel.status, pill: gSel.pill,
+        rows: [['Operator', gSel.owner], ['Priority', gSel.sev], [gSel.statusKey === 'closed' ? 'Resolved' : 'Expected by',
+          gSel.statusKey === 'closed' ? (gSel.resolvedText || 'Closed') : gSel.due + (gSel.overdue ? ' · overdue' : '')]]
       } : null,
-      openField: () => gSel && go('field', { fTicket: gSel.ref }),
+      openField: () => gSel && go('field', { fTicket: gSel.ref, fOperator: null }),
       activity: b.activity.map(a => ({ who: D.WHO[a.who], title: a.title, time: L.whenFull(a.at, now), text: a.text })),
-      liveNote: `Gia is handling this conversation. Replies are logged against ${b.id} in OI.`
+      liveNote: 'Gia is replying automatically.'
     };
   }
 
@@ -692,7 +739,7 @@ class OpsConsole extends React.Component {
     const sendDemo = () => { const text = s.draft.trim(); if (text) this.setState(st => ({ draft: '', demoOps: st.demoOps.concat([text]) })); };
     return {
       demo: true,
-      b: { id: demoB.id, name: demoB.name, initials: L.initials(demoB.name), sub: `WhatsApp · ${demoB.phone} · ${demoB.villa}` },
+      b: { id: demoB.id, name: demoB.name, initials: L.initials(demoB.name), stage: demoB.stage, sub: `${demoB.villa} · ${demoB.dates} · ${demoB.phone}` },
       chat, sc: scenarioNav('concierge'),
       takeover: s.demoTakeover, takeoverPending: false,
       toggleTakeover: () => this.setState(st => ({ demoTakeover: !st.demoTakeover })),
@@ -702,15 +749,15 @@ class OpsConsole extends React.Component {
         villa: { name: D.DEMO_VILLA.name, loc: D.DEMO_VILLA.loc, code: D.DEMO_VILLA.code },
         rows: [{ k: 'Booking', v: demoB.id, mono: true }, { k: 'Stay', v: demoB.dates }, { k: 'Party', v: demoB.party }, { k: 'Arrival', v: demoB.arrival }],
         noArrival: false,
-        prefs: prefs.map(x => ({ label: x.p, bg: x.fresh ? '#E6EEE7' : '#F8F3EF', border: x.fresh ? '#C9D9CC' : '#EDE4DC' })),
+        prefs: prefs.map(x => ({ label: x.p, bg: x.fresh ? '#E6EEE7' : '#F5F0E8', border: x.fresh ? '#C9D9CC' : '#EDE4DC' })),
         journey: [],
         caps: D.capRows(D.DEMO_VILLA.caps)
       },
       tickets: bT.map(t => ({ id: t.id, cat: t.cat, title: t.title, status: t.status, pill: D.statusPill(t.status), on: gSel && t.id === gSel.id, go: () => this.setState({ gTicket: t.id }) })),
-      t: d ? { title: d.title, flowItems: d.flowItems, history: d.history, rows: [['Owner', d.owner], ['Priority', d.sev], ['Source', d.origin]] } : null,
-      openField: () => gSel && go('field', { fTicket: gSel.id }),
+      t: d ? { title: d.title, status: d.status, pill: d.pill, rows: [['Operator', d.owner], ['Priority', d.sev]] } : null,
+      openField: () => gSel && go('field', { fTicket: gSel.id, fOperator: null }),
       activity: cS.slice(0, cCur + 1).map(x => ({ who: D.WHO[x.who], title: x.title, time: x.d + ', ' + x.t, text: x.event || x.decision || (x.msgs ? x.msgs[x.msgs.length - 1][1] : '') })).reverse(),
-      liveNote: `Demo scenario: replies here aren’t sent to anyone.`
+      liveNote: 'Demo scenario · replies here aren’t sent.'
     };
   }
 
@@ -730,12 +777,14 @@ class OpsConsole extends React.Component {
       const failed = visited && steps[lastVisit[n.id]].state === 'failed';
       const sh = D.SHAPES[tm.shape];
       return {
-        id: n.id, x: p.x, y: p.y, title: n.title, sub: n.sub, typeLabel: tm.label, tc: tm.c, tbg: tm.bg, mw: sh[0], mr: sh[1], mrot: sh[2],
-        border: isActive ? '2px solid #B93832' : failed ? '1px solid #E9B7B0' : off ? '1px dashed #D9CCC1' : '1px solid #E8DDD4',
+        id: n.id, x: p.x, y: p.y, title: n.title, sub: n.sub, typeLabel: tm.label, mw: sh[0], mr: sh[1], mrot: sh[2],
+        mc: tm.c,  // the type marker keeps its colour so the legend still reads
+        border: isActive ? '2px solid #C2412E' : failed ? '1px solid #E9B7B0' : off ? '1px dashed #D9CCC1' : '1px solid #E8DDD4',
         shadow: isActive ? '0 0 0 5px rgba(185,56,50,.12), 0 10px 24px rgba(41,39,37,.10)' : '0 1px 2px rgba(41,39,37,.05)',
-        opacity: off ? 0.45 : (!visited ? 0.7 : 1),
-        outline: n.id === selId && !isActive ? '2px solid #292725' : undefined,
-        dot: failed ? '✕' : isActive ? '●' : visited ? '✓' : '', dotC: failed || isActive ? '#B93832' : '#53735E',
+        opacity: 1,  // dimming with opacity fails contrast; a neutral header and dashed border de-emphasise instead
+        tc: off || !visited ? '#6A625C' : tm.c, tbg: off || !visited ? '#F1EBE6' : tm.bg,
+        outline: n.id === selId && !isActive ? '2px solid #1A1714' : undefined,
+        dot: failed ? '✕' : isActive ? '●' : visited ? '✓' : '', dotC: failed || isActive ? '#C2412E' : '#53735E',
         aria: n.title + ' — ' + (isActive ? 'current step' : visited ? 'completed' : off ? 'other branch' : 'upcoming'),
         onDown: e => { e.stopPropagation(); this.stopPlay(); this.drag = { id: n.id, sx: e.clientX, sy: e.clientY, ox: p.x, oy: p.y, moved: false }; },
         onKey: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this.setState({ sel: n.id }); } }
@@ -744,8 +793,8 @@ class OpsConsole extends React.Component {
     const labels = [];
     const edges = g.edges.map(([a, b, label], i) => {
       const geo = D.edgeGeometry(P[a], P[b]), key = a + '>' + b, off = !onPath.has(a) || !onPath.has(b), trav = traversed.has(key), last = key === lastEdge;
-      if (label) labels.push({ key: i, x: geo.mx, y: geo.my, text: label, fg: last || trav ? '#292725' : '#8A7F77', border: last ? '#B93832' : '#E0D5CB' });
-      return { key: i, d: geo.d, stroke: last ? '#B93832' : trav ? '#7A716B' : off ? '#E0D5CB' : '#CDBFB3', width: last ? 2.4 : trav ? 1.8 : 1.4, dash: off ? '5 5' : undefined, marker: `url(#gm-${last ? 'r' : trav ? 'd' : 'l'})` };
+      if (label) labels.push({ key: i, x: geo.mx, y: geo.my, text: label, fg: last || trav ? '#1A1714' : '#6A625C', border: last ? '#C2412E' : '#E0D5CB' });
+      return { key: i, d: geo.d, stroke: last ? '#C2412E' : trav ? '#7A716B' : off ? '#E0D5CB' : '#CDBFB3', width: last ? 2.4 : trav ? 1.8 : 1.4, dash: off ? '5 5' : undefined, marker: `url(#gm-${last ? 'r' : trav ? 'd' : 'l'})` };
     });
 
     // Side panel: the selected node (or the current step), and what happened there in this run.
@@ -753,8 +802,8 @@ class OpsConsole extends React.Component {
     const selActive = selId === active, offSel = !onPath.has(selId);
     const failedSel = stp && stp.state === 'failed';
     const statusText = selActive ? (failedSel ? 'Current · rejected' : 'Current step') : stp ? (failedSel ? 'Rejected' : 'Completed') : offSel ? 'Other branch' : 'Upcoming';
-    const statusColors = selActive ? ['#F8E9E2', '#9E2E29'] : stp ? (failedSel ? ['#F6DCD8', '#9E2E29'] : ['#E6EEE7', '#2F4A38']) : ['#F1EBE6', '#6E6762'];
-    const autColors = /Human|approval/.test(sn.autonomy) ? ['#292725', '#FFFFFF'] : /Autonomous|Gated/.test(sn.autonomy) ? ['#F8E9E2', '#9E2E29'] : ['#E7ECEF', '#3E5263'];
+    const statusColors = selActive ? ['#F9E6DF', '#A8382A'] : stp ? (failedSel ? ['#F6DCD8', '#A8382A'] : ['#E6EEE7', '#2F4A38']) : ['#F1EBE6', '#6E6762'];
+    const autColors = /Human|approval/.test(sn.autonomy) ? ['#1A1714', '#FFFFFF'] : /Autonomous|Gated/.test(sn.autonomy) ? ['#F9E6DF', '#A8382A'] : ['#E7ECEF', '#3E5263'];
     const tBase = D.SCENARIO_TICKETS[wf];
     const snap = stp ? D.deriveTicket(tBase, steps, li) : null;
     const otherBranch = wf === 'concierge' ? (s.cBranch === 'yes' ? 'no' : 'yes') : (s.fBranch === 'accept' ? 'escalate' : 'accept');
@@ -767,7 +816,11 @@ class OpsConsole extends React.Component {
       status: statusText, stBg: statusColors[0], stFg: statusColors[1],
       pinned: !!s.sel && s.sel !== active, unpin: () => this.setState({ sel: null }),
       stp,
-      stepLabel: stp ? `Step ${li + 1} · ${stp.d}, ${stp.t}` : 'Not reached in this run',
+      // Where people come in stays visible, never tucked into details.
+      needsPerson: sn.type === 'human' || /Human|approval/.test(sn.autonomy),
+      next: stp ? (steps[li + 1] ? steps[li + 1].title : 'End of this scenario') : null,
+      details: [['Actor', sn.actor], ['System', sn.system], ['Autonomy', sn.autonomy], ['Inputs', sn.inputs.join(', ')],
+        ['Outputs', sn.outputs.join(', ')], ['When', stp ? `${stp.d}, ${stp.t}` : 'Not reached in this run']],
       unreachedText: offSel ? 'This step belongs to the other decision branch. Switch paths to see what happens there.' : 'This step hasn’t happened yet in the scenario.',
       canJump: !stp && !offSel && firstIdx >= 0, jump: () => this.setStep(wf, firstIdx),
       canSwitch: offSel,
@@ -776,7 +829,7 @@ class OpsConsole extends React.Component {
         this.setState(wf === 'concierge' ? { cBranch: otherBranch, cStep: i, sel: null } : { fBranch: otherBranch, fStep: i, sel: null, cap: {} });
       },
       msgs: (stp && stp.msgs || []).map(([who, text]) => who === 'gia'
-        ? { align: 'flex-end', bg: '#F8E9E2', border: '#F0D7CC', who: 'Gia', whoC: '#9E2E29', text }
+        ? { align: 'flex-end', bg: '#F9E6DF', border: '#F0D7CC', who: 'Gia', whoC: '#A8382A', text }
         : { align: 'flex-start', bg: '#FFFFFF', border: '#EDE4DC', who: 'Guest', whoC: '#6E4532', text }),
       caps: D.capRows(D.DEMO_VILLA.caps),
       ticket: snap ? { id: snap.id, title: snap.title, owner: snap.owner, status: snap.status, pill: D.statusPill(snap.status) } : null,
@@ -784,10 +837,10 @@ class OpsConsole extends React.Component {
         n: stp.evidence.n, result: stp.evidence.result, bg: evColors[0], fg: evColors[1],
         items: stp.evidence.items.map(it => {
           const chk = stp.evidence.result === 'Checking';
-          return { label: it.label, glyph: chk ? '…' : it.ok ? '✓' : '✕', color: chk ? '#94600F' : it.ok ? '#53735E' : '#B93832', why: it.why, hasWhy: !chk && !it.ok };
+          return { label: it.label, glyph: chk ? '…' : it.ok ? '✓' : '✕', color: chk ? '#7A4F0C' : it.ok ? '#53735E' : '#C2412E', why: it.why, hasWhy: !chk && !it.ok };
         })
       } : null,
-      openLabel: wf === 'concierge' ? 'See it in the guest journey →' : 'See it in Operations →',
+      openLabel: wf === 'concierge' ? 'View guest journey' : 'View in Operations',
       open: () => wf === 'concierge' ? go('guests', { booking: DEMO, gTicket: tBase.id }) : go('field', { fTicket: tBase.id })
     };
     const wv = {
@@ -806,7 +859,7 @@ class OpsConsole extends React.Component {
       next: () => { this.stopPlay(); this.setStep(wf, cur + 1); },
       playLabel: s.playing ? 'Pause' : 'Play', togglePlay: () => s.playing ? this.stopPlay() : this.startPlay(),
       replay: () => { this.setStep(wf, 0); setTimeout(() => this.startPlay(), 50); },
-      dots: steps.map((x, i) => ({ bg: i < cur ? '#7A716B' : i === cur ? '#B93832' : '#E8DDD4', aria: 'Go to step ' + (i + 1) + ': ' + x.title, go: () => { this.stopPlay(); this.setStep(wf, i); } })),
+      dots: steps.map((x, i) => ({ bg: i < cur ? '#7A716B' : i === cur ? '#C2412E' : '#E8DDD4', aria: 'Go to step ' + (i + 1) + ': ' + x.title, go: () => { this.stopPlay(); this.setStep(wf, i); } })),
       onCanvasDown: e => { this.pan = { sx: e.clientX, sy: e.clientY, ox: s.px, oy: s.py }; this.forceUpdate(); },
       panning: !!this.pan,
       transform: `translate(${s.px}px, ${s.py}px) scale(${s.z})`,
@@ -823,6 +876,7 @@ class OpsConsole extends React.Component {
       ${Sidebar(vm)}
       ${Topbar(vm)}
       <main className="main">
+        ${vm.back && h`<button className="back-link" onClick=${vm.back.go}>← Back to ${vm.back.label}</button>`}
         ${vm.view === 'overview' && Overview(vm.ov, vm.sync)}
         ${vm.view === 'guests' && GuestJourneys(vm.gj, vm.sync, this.chatRef)}
         ${vm.view === 'field' && FieldOperations(vm.fo, vm.ph, vm.sync, vm.phoneRef)}
@@ -872,9 +926,8 @@ function Sidebar(vm) {
       </button>`)}
     </nav>
     <div className="demo-box">
-      <div className="tag">Live + demo</div>
-      <p>Bookings, chats, tickets and handoffs are live from Gia (mock OI). Items tagged Demo, the field app’s photo evidence and the workflow explorer are scripted.</p>
-      <button className="btn" onClick=${vm.resetDemo}>Reset demo scenarios</button>
+      <p>Items tagged <${DemoChip} /> and Workflows are scripted scenarios.</p>
+      <button className="btn-link" onClick=${vm.resetDemo}>Reset demo scenarios</button>
     </div>
   </aside>`;
 }
@@ -891,89 +944,82 @@ function Topbar(vm) {
 
 function Overview(ov, sync) {
   return h`<div className="page overview" data-screen-label="Overview">
-    <header className="page-head">
+    <header className="page-head compact">
       <div>
         <div className="kicker">${ov.date}</div>
-        <h1 className="page-title">Guest operations at a glance</h1>
+        <h1 className="page-title">Overview</h1>
       </div>
-      <${LiveTag} sync=${sync} />
+      <div className="head-actions">
+        <select className="select-sm" value=${ov.villa.value} onChange=${ov.villa.onChange} aria-label="Villa">
+          ${ov.villa.options.map(([v, label]) => h`<option key=${v} value=${v}>${label}</option>`)}
+        </select>
+        <${LiveTag} sync=${sync} />
+      </div>
     </header>
 
-    <div className="stats">
-      ${ov.stats.map(st => h`<button key=${st.label} className="card stat" onClick=${st.go}>
-        <span className="stat-label">${st.label}</span>
-        <span className="stat-value" style=${{ color: st.color }}>${st.value}</span>
-        <span className="note">${st.note}</span>
+    <div className="metrics" role="list">
+      ${ov.metrics.map(m => h`<button key=${m.key} role="listitem" className=${'metric' + (m.tone ? ' ' + m.tone : '')} onClick=${m.go}>
+        <b>${m.value}</b> ${m.label}
       </button>`)}
     </div>
 
-    <div className="ov-grid">
-      <div className="ov-col">
-        <section className="card panel tight">
-          <div className="section-head" style=${{ marginBottom: '6px' }}>
-            <h2 className="h2">Live activity</h2>
-            <span className="note">Tickets, requests for a person and resolved issues</span>
-          </div>
-          ${ov.conversations.map(c => h`<button key=${c.key} className="list-btn convo" onClick=${c.go}>
-            <span className="avatar">${c.initials}<i className="pulse"></i></span>
-            <span className="attn-body"><span className="attn-title">${c.title}</span><span className="note">${c.text}</span></span>
-            <span className="attn-go">Open chat →</span>
-          </button>`)}
-          ${ov.events.map(e => h`<button key=${e.key} className=${'list-btn event-row' + (e.urgent ? ' urgent' : '')} onClick=${e.go}>
+    <div className="ov-layout">
+      <div className="ov-main">
+        <section className="card section">
+          <h2 className="h2">Needs attention</h2>
+          ${ov.attention.length === 0 && h`<div className="all-clear">${ov.loaded ? h`<b>All clear.</b> Nothing needs a person right now.` : 'Loading…'}</div>`}
+          <ul className="attn-list">
+            ${ov.attention.map(a => h`<li key=${a.key} className=${'attn-item' + (a.primary ? ' first' : '')}>
+              <div className="attn-text">
+                <span className="chip-row"><span className=${'state-chip ' + a.tone}>${a.state}</span>${a.pill && Pill(a.pill, a.status)}</span>
+                <span className="attn-title">${a.title}</span>
+                <span className="note">${a.who}${a.who ? ' · ' : ''}<span className="mono">${a.ref}</span></span>
+              </div>
+              <button className=${a.primary ? 'btn-primary' : 'btn'} onClick=${a.go}>${a.action}</button>
+            </li>`)}
+          </ul>
+          ${ov.more && h`<button className="btn-link" onClick=${ov.more.go}>${ov.more.text}</button>`}
+        </section>
+
+        <section className="card section">
+          <h2 className="h2">Recent activity</h2>
+          ${ov.activity.items.map(e => h`<button key=${e.key} className=${'list-btn event-row' + (e.urgent ? ' urgent' : '')} onClick=${e.go}>
             <span className="feed-time">${e.time}</span>
             <span className="feed-who" style=${{ background: e.bg, color: e.fg }}>${e.label}</span>
             <span className="event-body"><span className="event-title">${e.title}</span>${e.text && h`<span className="note">${e.text}</span>`}</span>
           </button>`)}
-          ${ov.events.length === 0 && ov.conversations.length === 0 && h`<div className="empty">${ov.loaded ? 'Nothing yet. New tickets, requests for a person and resolved issues appear here as they happen.' : 'Loading…'}</div>`}
-        </section>
-
-        <section className="card panel tight">
-          <div className="section-head" style=${{ marginBottom: '6px' }}>
-            <h2 className="h2">Needs a person</h2>
-            <span className="note">Handoffs, delays and urgent issues</span>
-          </div>
-          ${ov.attention.map(a => h`<button key=${a.key} className="list-btn attn" onClick=${a.go}>
-            <span className="attn-icon">${a.icon}</span>
-            <span className="attn-body">
-              <span className="attn-title">${a.title}</span>
-              <span className="note">${a.meta}</span>
-              <span className="attn-reason">${a.reason}</span>
-            </span>
-            <span className="attn-go">Review →</span>
-          </button>`)}
-          ${ov.attention.length === 0 && h`<div className="empty">${ov.loaded ? 'Nothing needs a person right now.' : 'Loading…'}</div>`}
+          ${ov.activity.items.length === 0 && h`<div className="empty">${ov.loaded ? 'No activity yet.' : 'Loading…'}</div>`}
+          ${ov.activity.more && h`<button className="btn-link" onClick=${ov.activity.more}>Show more</button>`}
         </section>
       </div>
 
-      <div className="ov-col">
-        <section className="card panel block">
-          <h2 className="h2" style=${{ marginBottom: '10px' }}>Active stays</h2>
-          ${ov.stays.map(b => h`<button key=${b.key} className="list-btn stay" onClick=${b.go}>
+      <aside className="ov-side">
+        ${ov.conversations.length > 0 && h`<section className="card section">
+          <h2 className="h3">In conversation now</h2>
+          ${ov.conversations.map(c => h`<button key=${c.key} className="list-btn mini-row" onClick=${c.go}>
+            <span className="avatar">${c.initials}<i className="pulse"></i></span>
+            <span className="mini-body"><b>${c.title}</b><span className="note">${c.text}</span></span>
+          </button>`)}
+        </section>`}
+        <section className="card section">
+          <h2 className="h3">Stays</h2>
+          ${ov.stays.map(b => h`<button key=${b.key} className="list-btn mini-row" onClick=${b.go}>
             <span className="avatar">${b.initials}</span>
-            <span className="stay-body">
-              <span className="stay-name">${b.name}</span>
-              <span className="note">${b.villa} · ${b.dates}</span>
-            </span>
-            <span className="stay-open">${b.openText}</span>
+            <span className="mini-body"><b>${b.name}</b><span className="note">${b.sub} · ${b.stage}</span></span>
+            ${b.open > 0 && h`<span className="count-badge" title="Open tickets">${b.open}</span>`}
           </button>`)}
           ${ov.stays.length === 0 && h`<div className="empty">${ov.loaded ? 'No guests in stay or arriving.' : 'Loading…'}</div>`}
         </section>
-        <section className="card panel block">
-          <div className="section-head" style=${{ marginBottom: '10px' }}>
-            <h2 className="h2">Operators</h2>
-            <span className="note">Onsite first for new tasks</span>
-          </div>
-          ${ov.operators.map(o => h`<button key=${o.key} className="list-btn stay" onClick=${o.go}>
+        <section className="card section">
+          <h2 className="h3">Operators</h2>
+          ${ov.operators.map(o => h`<button key=${o.key} className="list-btn mini-row" onClick=${o.go}>
             <span className="avatar">${o.initials}</span>
-            <span className="stay-body">
-              <span className="stay-name">${o.name} <${PresenceChip} presence=${o.presence} /></span>
-              <span className="note">${o.roles}</span>
-            </span>
-            <span className="stay-open">${o.openText}${o.avg && h`<br/><span className="muted-sm">${o.avg}</span>`}</span>
+            <span className="mini-body"><b>${o.name}</b><span className="note">${o.open ? o.open + ' open' : 'Free'}</span></span>
+            <${PresenceChip} presence=${o.presence} />
           </button>`)}
-          ${ov.operators.length === 0 && h`<div className="empty">${ov.loaded ? h`No operators yet. <button className="btn-link" onClick=${ov.addOperator}>Add one</button>` : 'Loading…'}</div>`}
+          ${ov.operators.length === 0 && h`<div className="empty">${ov.loaded ? h`No operators yet. <button className="btn-link" onClick=${ov.addOperator}>Add operator</button>` : 'Loading…'}</div>`}
         </section>
-      </div>
+      </aside>
     </div>
   </div>`;
 }
@@ -1007,24 +1053,21 @@ function ScenarioBar(sc) {
 }
 
 function BookingRow(b) {
-  return h`<button key=${b.key} className="list-btn booking-row" onClick=${b.go} style=${{ background: b.on ? '#F8E9E2' : '#FFFFFF' }}>
+  return h`<button key=${b.key} className=${'list-btn booking-row' + (b.on ? ' on' : '')} onClick=${b.go} aria-current=${b.on ? 'true' : undefined}>
     <span className="top">
       <span className="name">${b.name}${b.demo && h` <${DemoChip} />`}</span>
       <span className="chip-tag" style=${{ background: b.stBg, color: b.stFg }}>${b.stage}</span>
     </span>
-    <span className="note">${b.villa} · ${b.dates}</span>
-    <span className="meta"><span className="mono">${b.id}</span><span>${b.openText}</span></span>
+    <span className="note">${b.villa} · ${b.dates}${b.openText !== 'No open tickets' ? ' · ' + b.openText : ''}</span>
+    ${b.waiting && h`<span className="state-chip red">Needs a person</span>`}
   </button>`;
 }
 
 function GuestJourneys(gj, sync, chatRef) {
-  const t = gj.t, p = gj.profile;
+  const t = gj.t, p = gj.profile, waiting = gj.handoffs.length > 0;
   return h`<div className="page" data-screen-label="Guest Journeys">
-    <header className="page-head">
-      <div>
-        <div className="kicker">Use case 1 · Continuous concierge</div>
-        <h1 className="page-title">Guest journeys</h1>
-      </div>
+    <header className="page-head compact">
+      <h1 className="page-title">Guest journeys</h1>
       <${LiveTag} sync=${sync} />
     </header>
     <div className="columns">
@@ -1034,7 +1077,7 @@ function GuestJourneys(gj, sync, chatRef) {
         </div>
         <div className="scroll">
           ${gj.list.map(BookingRow)}
-          ${gj.list.length === 0 && h`<div className="empty list-empty">${!gj.loaded ? 'Loading bookings…' : gj.search ? 'No bookings match.' : 'No live bookings yet.'}</div>`}
+          ${gj.list.length === 0 && h`<div className="empty list-empty">${!gj.loaded ? 'Loading…' : gj.search ? 'No bookings match.' : 'No bookings yet.'}</div>`}
           ${gj.demoList.length > 0 && h`<div className="list-divider">Demo scenario</div>`}
           ${gj.demoList.map(BookingRow)}
         </div>
@@ -1044,24 +1087,26 @@ function GuestJourneys(gj, sync, chatRef) {
         <div className="chat-head">
           <span className="avatar">${gj.b.initials}</span>
           <div className="chat-head-body">
-            <div className="chat-head-name">${gj.b.name}${gj.demo && h` <${DemoChip} />`}</div>
+            <div className="chat-head-name">${gj.b.name}${gj.demo && h` <${DemoChip} />`} <span className="stage-tag">${gj.b.stage}</span></div>
             <div className="chat-head-sub">${gj.b.sub}</div>
           </div>
-          <button className="btn" onClick=${gj.toggleTakeover} disabled=${gj.takeoverPending}>${gj.takeover ? 'Hand back to Gia' : 'Take over'}</button>
+          <button className=${gj.takeover ? 'btn' : waiting ? 'btn-primary' : 'btn'} onClick=${gj.toggleTakeover} disabled=${gj.takeoverPending}>
+            ${gj.takeover ? 'Hand back to Gia' : 'Take over'}
+          </button>
         </div>
         ${gj.sc && ScenarioBar(gj.sc)}
-        ${gj.handoffs.map(ho => h`<div key=${ho.id} className=${'handoff-bar' + (ho.urgent ? ' urgent' : '')}>
-          <span className="tx"><b>${ho.urgent ? 'Urgent · ' : ''}Needs a person</b> · ${ho.reason} <span className="at">${ho.at}</span></span>
-          <button className="btn" onClick=${ho.resolve} disabled=${ho.pending}>Mark resolved</button>
+        ${gj.handoffs.map(ho => h`<div key=${ho.id} className=${'handoff-bar' + (ho.urgent ? ' urgent' : '')} role="status">
+          <span className="tx"><b>${ho.urgent ? 'Urgent · needs a person' : 'Needs a person'}</b> · ${ho.reason} <span className="at">${ho.at}</span></span>
+          <button className="btn small" onClick=${ho.resolve} disabled=${ho.pending}>Mark resolved</button>
         </div>`)}
-        ${gj.takeover && h`<div className="takeover-banner">You’re handling this conversation. Gia is paused for this guest until you hand back.</div>`}
+        ${gj.takeover && h`<div className="takeover-banner">You’re replying · Gia is paused for this guest.</div>`}
         <div ref=${chatRef} className="chat-log">
           ${gj.chat.map(ChatItem)}
           ${gj.chat.length === 0 && h`<div className="chat-date">No messages yet</div>`}
         </div>
         <div className="composer">
           ${gj.takeover
-            ? h`<${Frag}><input value=${gj.draft} onChange=${gj.onDraft} onKeyDown=${gj.onDraftKey} disabled=${gj.sending} placeholder=${gj.demo ? 'Reply as the ops team (demo, not sent)…' : 'Reply to the guest on WhatsApp…'} aria-label="Reply as the ops team" />
+            ? h`<${Frag}><input value=${gj.draft} onChange=${gj.onDraft} onKeyDown=${gj.onDraftKey} disabled=${gj.sending} placeholder=${gj.demo ? 'Reply (demo, not sent)…' : 'Reply on WhatsApp…'} aria-label="Reply to the guest" />
                 <button className="send" onClick=${gj.send} disabled=${gj.sending}>${gj.sending ? 'Sending…' : 'Send'}</button><//>`
             : h`<${Frag}><span className="live"></span>
                 <span className="status">${gj.liveNote}</span><//>`}
@@ -1074,69 +1119,60 @@ function GuestJourneys(gj, sync, chatRef) {
         </div>
         <div className="tab-body">
           ${gj.tab === 'profile' && h`<${Frag}>
-            <div className="hatch villa-photo">villa photo · ${p.villa.name}</div>
             <div>
               <div className="villa-name">${p.villa.name}</div>
-              <div className="villa-loc">${p.villa.loc} · <span className="mono">${p.villa.code}</span></div>
+              <div className="villa-loc">${p.villa.loc}</div>
             </div>
-            <div className="kv">
-              ${p.rows.map(r => h`<${Frag} key=${r.k}><span className="k">${r.k}</span><span className=${r.mono ? 'mono' : ''} style=${r.mono ? { fontSize: '12.5px' } : null}>${r.v}</span><//>`)}
-              ${p.noArrival && h`<${Frag}><span className="k">Arrival</span><span>Not shared yet</span><//>`}
-            </div>
+            <dl className="kv">
+              ${p.rows.map(r => h`<${Frag} key=${r.k}><dt className="k">${r.k}</dt><dd className=${r.mono ? 'mono' : ''}>${r.v}</dd><//>`)}
+              ${p.noArrival && h`<${Frag}><dt className="k">Arrival</dt><dd>Not shared yet</dd><//>`}
+            </dl>
             <div className="stack">
-              <div className="eyebrow">Preferences · OI guest profile</div>
+              <div className="eyebrow">Preferences</div>
               <div className="prefs">
                 ${p.prefs.map((x, i) => h`<span key=${i} className="pref" title=${x.title} style=${{ background: x.bg, border: '1px solid ' + x.border }}>${x.label}</span>`)}
               </div>
-              ${p.prefs.length === 0 && h`<span className="note" style=${{ color: '#8A7F77' }}>None captured yet.</span>`}
+              ${p.prefs.length === 0 && h`<span className="note">None yet.</span>`}
             </div>
             ${p.journey.length > 0 && h`<div className="stack sm">
-              <div className="eyebrow">Pre-arrival messages · UC-OPS-01</div>
+              <div className="eyebrow">Pre-arrival messages</div>
               ${p.journey.map(j => h`<div key=${j.k} className="mark-row">
                 <span className="g" style=${{ color: j.color }}>${j.glyph}</span><span className="spacer">${j.k}</span><span className="n">${j.note}</span>
               </div>`)}
             </div>`}
-            <div className="stack sm">
-              <div className="caps-head"><span className="eyebrow">Villa capabilities</span><span className="ro">read-only</span></div>
-              ${p.caps.map(c => h`<div key=${c.k} className="mark-row">
-                <span className="g" style=${{ color: c.color }}>${c.glyph}</span><span className="spacer">${c.k}</span><span className="n">${c.note}</span>
-              </div>`)}
-            </div><//>`}
+            <details className="more">
+              <summary>Villa capabilities</summary>
+              <div className="more-body">
+                ${p.caps.map(c => h`<div key=${c.k} className="mark-row">
+                  <span className="g" style=${{ color: c.color }}>${c.glyph}</span><span className="spacer">${c.k}</span><span className="n">${c.note}</span>
+                </div>`)}
+              </div>
+            </details><//>`}
 
           ${gj.tab === 'tickets' && h`<${Frag}>
             <div className="stack">
-              ${gj.tickets.map(tk => h`<button key=${tk.id} className="list-btn ticket-card" onClick=${tk.go} style=${{ border: '1px solid ' + (tk.on ? '#B93832' : '#E8DDD4'), background: tk.on ? '#FFFCFA' : '#FFFFFF' }}>
-                <span className="top"><span className="id">${tk.id} · ${tk.cat}</span>${Pill(tk.pill, tk.status)}</span>
-                <span className="title">${tk.title}</span>
+              ${gj.tickets.map(tk => h`<button key=${tk.id} className=${'list-btn ticket-card' + (tk.on ? ' on' : '')} onClick=${tk.go}>
+                <span className="top"><span className="title">${tk.title}</span>${Pill(tk.pill, tk.status)}</span>
+                <span className="id">${tk.id} · ${tk.cat}${tk.flag ? ' · ' + tk.flag.text : ''}</span>
               </button>`)}
-              ${gj.tickets.length === 0 && h`<div className="note" style=${{ fontSize: '13px' }}>No tickets for this booking yet.</div>`}
+              ${gj.tickets.length === 0 && h`<div className="note">No tickets for this guest.</div>`}
             </div>
             ${t && h`<div className="ticket-detail">
-              <div className="title">${t.title}</div>
-              <div className="kv">
-                ${t.rows.map(([k, v]) => h`<${Frag} key=${k}><span className="k">${k}</span><span>${v}</span><//>`)}
-              </div>
-              <div className="flow-bars">
-                ${t.flowItems.map(f => h`<div key=${f.label}><div className="bar" style=${{ background: f.bg }}></div><span style=${{ color: f.fg }}>${f.label}</span></div>`)}
-              </div>
-              <div>
-                ${t.history.map((x, i) => HistoryRow(x, i))}
-              </div>
-              <button className="btn" onClick=${gj.openField}>Open in Operations →</button>
+              <dl className="kv">
+                ${t.rows.map(([k, v]) => h`<${Frag} key=${k}><dt className="k">${k}</dt><dd>${v}</dd><//>`)}
+              </dl>
+              <button className="btn" onClick=${gj.openField}>Open in Operations</button>
             </div>`}<//>`}
 
           ${gj.tab === 'activity' && h`<${Frag}>
-            <div className="note">What Gia and the team did on this booking, newest first.</div>
-            <div>
-              ${gj.activity.map((a, i) => h`<div key=${i} className="activity-row">
-                <span className="who" style=${{ background: a.who.bg, color: a.who.fg }}>${a.who.label}</span>
-                <div className="body">
-                  <div className="top"><span className="ti">${a.title}</span><span className="t">${a.time}</span></div>
-                  <div className="tx">${a.text}</div>
-                </div>
-              </div>`)}
-              ${gj.activity.length === 0 && h`<div className="note">Nothing yet.</div>`}
-            </div><//>`}
+            ${gj.activity.map((a, i) => h`<div key=${i} className="activity-row">
+              <span className="who" style=${{ background: a.who.bg, color: a.who.fg }}>${a.who.label}</span>
+              <div className="body">
+                <div className="top"><span className="ti">${a.title}</span><span className="t">${a.time}</span></div>
+                <div className="tx">${a.text}</div>
+              </div>
+            </div>`)}
+            ${gj.activity.length === 0 && h`<div className="note">Nothing yet.</div>`}<//>`}
         </div>
       </div>
     </div>
@@ -1153,13 +1189,12 @@ function HistoryRow(x, i) {
 // ---------- operations ----------
 
 function TaskRow(r) {
-  return h`<button key=${r.key} className="list-btn task-row" onClick=${r.go} style=${{ background: r.on ? '#F8E9E2' : '#FFFFFF' }}>
-    <span className="top"><span className="id">${r.ref}${r.demo && h` <${DemoChip} />`}</span>${Pill(r.pill, r.status)}</span>
-    <span className="title">${r.title}</span>
-    <span className="meta"><span>${r.villa}</span><span>${r.cat}</span><span className="sev" style=${{ color: r.sevColor }}>${r.sevGlyph} ${r.sev}</span></span>
-    <span className="foot">
+  return h`<button key=${r.key} className=${'list-btn task-row' + (r.on ? ' on' : '')} onClick=${r.go} aria-current=${r.on ? 'true' : undefined}>
+    <span className="top"><span className="title">${r.title}</span>${Pill(r.pill, r.status)}</span>
+    <span className="meta">
+      <span className="mono">${r.ref}</span>${r.demo && h` <${DemoChip} />`}<span>${r.villa}</span>
+      <span className="sev" style=${{ color: r.sevColor }}>${r.sevGlyph} ${r.sev}</span>
       ${r.flag ? h`<span className="time-flag" title=${r.flag.title} style=${{ color: r.flag.color, background: r.flag.bg }}>${r.flag.text}</span>` : h`<span>${r.ownerShort}</span>`}
-      <span>Updated ${r.updated}</span>
     </span>
   </button>`;
 }
@@ -1178,61 +1213,78 @@ function OpGroup(g) {
   <//>`;
 }
 
-function LiveTicketDetail(t) {
-  return h`<${Frag}>
-    <div className="task-head">
-      <div>
-        <div className="ref">${t.id} · ${t.villa} · ${t.cat}</div>
-        <div className="title">${t.title}</div>
+function HistoryDetails(t, extra) {
+  return h`<details className="more">
+    <summary>History & details</summary>
+    <div className="more-body">
+      ${t.details && h`<dl className="facts">${t.details.map(([k, v]) => h`<div key=${k}><dt>${k}</dt><dd>${v}</dd></div>`)}</dl>`}
+      ${t.flowItems && h`<div className="flow-bars">
+        ${t.flowItems.map(f => h`<div key=${f.label}><div className="bar" style=${{ background: f.bg }}></div><span style=${{ color: f.fg }}>${f.label}</span></div>`)}
+      </div>`}
+      ${extra}
+      <div className="audit">
+        <div className="eyebrow">Audit trail</div>
+        ${t.history.map((x, i) => HistoryRow(x, i))}
+        ${t.history.length === 0 && h`<div className="note">No entries yet.</div>`}
       </div>
-      ${Pill(t.pill, t.status)}
     </div>
-    <div className="assign">
+  </details>`;
+}
+
+function LiveTicketDetail(t) {
+  const a = t.assign;
+  return h`<${Frag}>
+    <div className="ticket-head">
+      <div className="ref">${t.id} · ${t.villa} · ${t.cat}</div>
+      <h2 className="title">${t.title}</h2>
+      <div className="chips">
+        ${Pill(t.pill, t.status)}
+        <span className="sev-chip" style=${{ color: t.sevColor }}>${t.sevGlyph} ${t.sev}</span>
+        ${t.flag && h`<span className="time-flag" title=${t.flag.title} style=${{ color: t.flag.color, background: t.flag.bg }}>${t.flag.text}</span>`}
+      </div>
+    </div>
+    ${t.overdue && h`<div className="alert-bar" role="status">${t.overdue}</div>`}
+
+    <section className="next-action" aria-label="Next step">
+      ${t.closed ? h`<div className="resolved-line">${t.resolvedText || 'Closed'}</div>`
+        : t.unassigned ? h`<${Frag}>
+            <label className="next-label" htmlFor="assign-select">Assign operator</label>
+            ${a.hasOperators
+              ? h`<select id="assign-select" className="select-primary" value=${a.value} onChange=${a.onChange} disabled=${a.pending}>
+                  ${a.options.map(([v, label]) => h`<option key=${v} value=${v}>${label}</option>`)}
+                </select>`
+              : h`<button className="btn-primary" onClick=${a.addOperator}>Add an operator</button>`}
+          <//>`
+        : h`<button className="btn-primary" onClick=${t.primary.go} disabled=${t.primary.pending}>${t.primary.label}</button>`}
+      ${t.secondary.length > 0 && h`<div className="secondary-actions">
+        ${t.secondary.map(x => h`<button key=${x.key} className="btn small" onClick=${x.go} disabled=${x.pending}>${x.label}</button>`)}
+      </div>`}
+      ${!t.closed && h`<p className="note">${t.notifyText}</p>`}
+    </section>
+
+    <section className="request">
+      <div className="eyebrow">${t.requestLabel}</div>
+      <p>${t.issue}</p>
+      <div className="note">${t.reporter}${t.openJourney && h` · <button className="btn-link" onClick=${t.openJourney}>View guest journey</button>`}</div>
+    </section>
+
+    ${!t.unassigned && h`<div className="assignee-row">
       <label className="k" htmlFor="op-select">Operator</label>
-      <select id="op-select" value=${t.operator.value} onChange=${t.operator.onChange} disabled=${t.operator.pending}>
-        ${t.operator.options.map(([v, label]) => h`<option key=${v} value=${v}>${label}</option>`)}
+      <select id="op-select" value=${a.value} onChange=${a.onChange} disabled=${a.pending}>
+        ${a.options.map(([v, label]) => h`<option key=${v} value=${v}>${label}</option>`)}
       </select>
-      ${t.flag && h`<span className="time-flag" title=${t.flag.title} style=${{ color: t.flag.color, background: t.flag.bg }}>${t.flag.text}</span>`}
-    </div>
-    ${t.resolvedText && h`<div className="resolved-line">${t.resolvedText}</div>`}
-    <div className="facts">
-      ${t.facts.map(f => h`<div key=${f.k}><div className="k">${f.k}</div><div className="v" style=${{ color: f.color, fontWeight: f.strong ? 700 : undefined }}>${f.v}</div></div>`)}
-    </div>
-    <div className="flow-bars">
-      ${t.flowItems.map(f => h`<div key=${f.label}><div className="bar" style=${{ background: f.bg }}></div><span style=${{ color: f.fg }}>${f.label}</span></div>`)}
-    </div>
-    <div className="status-actions">
-      <div className="eyebrow">Update status</div>
-      ${t.closed
-        ? h`<p className="note">Closed. No further updates.</p>`
-        : h`<div className="row">${t.actions.map(a => h`<button key=${a.key} className=${a.key === 'closed' ? 'btn-primary' : 'btn'} onClick=${a.go} disabled=${a.pending}>${a.label}</button>`)}</div>`}
-      <p className="note">${t.notifyText}</p>
-    </div>
-    <div className="report">
-      <div className="eyebrow">Original report${t.reporter ? ' · ' + t.reporter : ''}</div>
-      <p style=${{ whiteSpace: 'pre-wrap' }}>${t.issue}</p>
-    </div>
-    <div className="review" style=${{ border: '1px solid #E8DDD4', background: '#F8F3EF' }}>
-      <div className="top"><span className="title">Closure</span></div>
-      <p>Closes when the operator replies DONE on WhatsApp or taps Mark done in the field app, or when ops sets it to Closed. The time to resolve is recorded. Photo-verified closure isn’t connected for live tickets yet; the demo ticket ${DEMO_FIELD_TICKET} shows how it will work.</p>
-    </div>
-    <div className="audit">
-      <div className="eyebrow">Audit trail · OI</div>
-      ${t.history.map((x, i) => HistoryRow(x, i))}
-      ${t.history.length === 0 && h`<div className="note">No entries yet.</div>`}
-    </div>
-    ${t.openJourney && h`<button className="btn" style=${{ alignSelf: 'flex-start' }} onClick=${t.openJourney}>Open guest journey →</button>`}
+    </div>`}
+
+    ${HistoryDetails(t, h`<p className="note">Closes when the operator replies DONE on WhatsApp or taps Mark done, or when ops resolves it. Photo-verified closure is shown on the demo ticket ${DEMO_FIELD_TICKET}.</p>`)}
   <//>`;
 }
 
 function DemoTicketDetail(t, fo) {
   return h`<${Frag}>
-    <div className="task-head">
-      <div>
-        <div className="ref">${t.id} · ${t.villa} · ${t.cat} · <${DemoChip} /></div>
-        <div className="title">${t.title}</div>
-      </div>
-      ${Pill(t.pill, t.status)}
+    <div className="ticket-head">
+      <div className="ref">${t.id} · ${t.villa} · ${t.cat} · <${DemoChip} /></div>
+      <h2 className="title">${t.title}</h2>
+      <div className="chips">${Pill(t.pill, t.status)}<span className="sev-chip" style=${{ color: t.sevColor }}>${t.sevGlyph} ${t.sev}</span></div>
     </div>
     <div className="facts">
       <div><div className="k">Owner</div><div className="v">${t.owner}</div></div>
@@ -1295,10 +1347,7 @@ function DemoTicketDetail(t, fo) {
       </div>
     </div>`)}
 
-    <div className="audit">
-      <div className="eyebrow">Audit trail · OI</div>
-      ${t.history.map((x, i) => HistoryRow(x, i))}
-    </div>
+    ${HistoryDetails({ history: t.history })}
     ${t.scenario && h`<div className="task-scenario">
       <span className="step-text">Step ${fo.sc.no} of ${fo.sc.total} · <b>${fo.sc.title}</b></span>
       <span className="spacer"></span>
@@ -1312,51 +1361,55 @@ function DemoTicketDetail(t, fo) {
 function FieldOperations(fo, ph, sync, phoneRef) {
   const d = fo.opDetail;
   return h`<div className="page" data-screen-label="Operations">
-    <header className="page-head">
-      <div>
-        <div className="kicker">Use case 2 · Verified housekeeping & maintenance</div>
-        <h1 className="page-title">Operations</h1>
-      </div>
+    <header className="page-head compact">
+      <h1 className="page-title">Operations</h1>
       <div className="head-actions">
         <${LiveTag} sync=${sync} />
-        <button className="btn-primary small" onClick=${fo.add.show}>+ Add operator</button>
+        <button className="btn small" onClick=${fo.add.show}>+ Add operator</button>
       </div>
     </header>
-    <div className="filters">
+    <div className="toolbar">
+      <div className="view-tabs" role="group" aria-label="Ticket view">
+        ${fo.views.map(v => h`<button key=${v.key} className=${(v.on ? 'on' : '') + (v.alert ? ' alert' : '')} onClick=${v.go} aria-pressed=${v.on}>
+          ${v.label} <span className="n">${v.count}</span>
+        </button>`)}
+      </div>
+      <button className="btn-link" onClick=${fo.toggleMore} aria-expanded=${fo.moreOpen}>More filters${fo.extraCount ? ` (${fo.extraCount})` : ''}</button>
+    </div>
+    ${fo.moreOpen && h`<div className="filters">
       ${fo.filters.map(f => h`<select key=${f.key} value=${f.value} onChange=${f.onChange} aria-label=${f.aria}>
         ${f.options.map(([v, label]) => h`<option key=${v} value=${v}>${label}</option>`)}
       </select>`)}
-      <span className="note count">${fo.countText}</span>
-      ${fo.isFiltered && h`<button className="btn-link" onClick=${fo.clear}>Clear filters</button>`}
-    </div>
+      ${fo.isFiltered && h`<button className="btn-link" onClick=${fo.clear}>Clear</button>`}
+    </div>`}
 
-    <div className="columns field-cols">
+    <div className=${'columns field-cols' + (ph.show ? '' : ' no-phone')}>
       <div className="card task-list">
         ${fo.groups.map(OpGroup)}
-        ${fo.groups.length === 0 && h`<div className="empty">${!fo.loaded ? 'Loading…' : fo.hasLive ? 'Nothing matches these filters.' : h`No operators or live tickets yet. <button className="btn-link" onClick=${fo.add.show}>Add an operator</button>`}</div>`}
-        ${fo.demoRows.length > 0 && h`<div className="list-divider">Demo scenarios · scripted</div>`}
+        ${fo.groups.length === 0 && h`<div className="empty">${!fo.loaded ? 'Loading…' : fo.hasLive ? 'No tickets in this view.' : h`No tickets or operators yet. <button className="btn-link" onClick=${fo.add.show}>Add operator</button>`}</div>`}
+        ${fo.demoRows.length > 0 && h`<div className="list-divider">Demo scenarios</div>`}
         ${fo.demoRows.map(TaskRow)}
       </div>
 
       <div className="card task-detail">
         ${fo.t ? (fo.t.live ? LiveTicketDetail(fo.t) : DemoTicketDetail(fo.t, fo))
           : d ? h`<${Frag}>
-              <div className="task-head">
-                <div><div className="ref">Field operator · ${d.phone}</div><div className="title">${d.name}</div></div>
-                <${PresenceChip} presence=${d.presence} />
+              <div className="ticket-head">
+                <div className="ref">Operator · ${d.phone}</div>
+                <h2 className="title">${d.name}</h2>
+                <div className="chips"><${PresenceChip} presence=${d.presence} /></div>
               </div>
-              <p className="note" style=${{ margin: 0 }}>${d.roles}</p>
-              <div className="facts">${d.facts.map(([k, v]) => h`<div key=${k}><div className="k">${k}</div><div className="v">${v}</div></div>`)}</div>
-              <div className="status-actions">
-                <div className="eyebrow">Where they are</div>
-                <div className="row"><button className="btn" onClick=${d.togglePresence} disabled=${d.pending}>Mark ${d.presence === 'onsite' ? 'offsite' : 'onsite'}</button></div>
-                <p className="note">New tasks go to an onsite operator first. Operators can also reply ONSITE or OFFSITE on WhatsApp.</p>
+              <p className="note">${d.roles}</p>
+              <dl className="facts">${d.facts.map(([k, v]) => h`<div key=${k}><dt>${k}</dt><dd>${v}</dd></div>`)}</dl>
+              <div className="next-action">
+                <button className="btn" onClick=${d.togglePresence} disabled=${d.pending}>Mark ${d.presence === 'onsite' ? 'offsite' : 'onsite'}</button>
+                <p className="note">New tasks go to onsite operators first. Operators can also reply ONSITE or OFFSITE.</p>
               </div>
             <//>`
-          : h`<div className="empty">Select a ticket or an operator.</div>`}
+          : h`<div className="empty">Select a ticket.</div>`}
       </div>
 
-      ${Phone(ph, phoneRef)}
+      ${ph.show && Phone(ph, phoneRef)}
     </div>
   </div>`;
 }
@@ -1432,7 +1485,7 @@ function OperatorPhone(op, phoneRef) {
 
 function Phone(ph, phoneRef) {
   return h`<div className="phone-col">
-    <div className="eyebrow">Field app · what the team sees</div>
+    <div className="eyebrow">${ph.op ? 'Operator chat · WhatsApp' : 'Field app preview'}</div>
     <div className="phone">
       ${ph.op ? OperatorPhone(ph.op, phoneRef) : h`<${Frag}>
       <div className="phone-head">
@@ -1453,7 +1506,7 @@ function Phone(ph, phoneRef) {
         ${ph.capture && h`<${Frag}>
           <div className="phone-label">Add a photo for each item</div>
           ${ph.slots.map(sl => Slot(sl))}
-          <button className="phone-cta" onClick=${ph.submit} disabled=${!ph.canSubmit} style=${{ background: ph.canSubmit ? '#B93832' : '#D9CCC1' }}>Submit evidence</button><//>`}
+          <button className="phone-cta" onClick=${ph.submit} disabled=${!ph.canSubmit} style=${{ background: ph.canSubmit ? '#C2412E' : '#D9CCC1' }}>Submit evidence</button><//>`}
         ${ph.checking && h`<div className="phone-state checking">
           <span className="icon">◎</span><span className="ti">Checking your photos…</span><span className="tx">Each photo is compared against its checklist item.</span>
         </div>`}
@@ -1464,7 +1517,7 @@ function Phone(ph, phoneRef) {
           </div>
           ${ph.canRetake && h`<${Frag}>
             ${ph.retake.map(sl => Slot(sl, 'Retake · '))}
-            <button className="phone-cta" onClick=${ph.resubmit} disabled=${!ph.canResubmit} style=${{ background: ph.canResubmit ? '#B93832' : '#D9CCC1' }}>Resubmit evidence</button><//>`}<//>`}
+            <button className="phone-cta" onClick=${ph.resubmit} disabled=${!ph.canResubmit} style=${{ background: ph.canResubmit ? '#C2412E' : '#D9CCC1' }}>Resubmit evidence</button><//>`}<//>`}
         ${ph.accepted && h`<div className="phone-state accepted">
           <span className="icon">✓</span><span className="ti">Evidence accepted</span><span className="tx">${ph.acceptedText}</span>
         </div>`}
@@ -1481,9 +1534,9 @@ function Phone(ph, phoneRef) {
 function Workflows(wv, pd, canvasRef) {
   const marker = (id, c) => h`<marker key=${id} id=${id} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill=${c} /></marker>`;
   return h`<div className="page workflows" data-screen-label="Workflows">
-    <header className="page-head">
+    <header className="page-head compact">
       <div>
-        <div className="kicker">Workflow explorer · scripted scenario</div>
+        <div className="kicker">Scripted scenario</div>
         <h1 className="page-title">${wv.heading}</h1>
       </div>
       <div className="switcher">
@@ -1492,8 +1545,7 @@ function Workflows(wv, pd, canvasRef) {
     </header>
 
     <div className="wf-bar">
-      <div className="branches">
-        <span className="lbl">Scenario path</span>
+      <div className="branches" role="group" aria-label="Scenario path">
         ${wv.branches.map(o => h`<button key=${o.id} className=${o.on ? 'on' : ''} onClick=${o.go} aria-pressed=${o.on}>${o.label}</button>`)}
       </div>
       <div className="legend">
@@ -1507,14 +1559,14 @@ function Workflows(wv, pd, canvasRef) {
           <div ref=${canvasRef} className=${'canvas' + (wv.panning ? ' panning' : '')} onPointerDown=${wv.onCanvasDown}>
             <div className="canvas-layer" style=${{ transform: wv.transform }}>
               <svg className="edges" width="1400" height="900">
-                <defs>${marker('gm-r', '#B93832')}${marker('gm-d', '#7A716B')}${marker('gm-l', '#CDBFB3')}</defs>
+                <defs>${marker('gm-r', '#C2412E')}${marker('gm-d', '#7A716B')}${marker('gm-l', '#CDBFB3')}</defs>
                 ${wv.edges.map(e => h`<path key=${e.key} d=${e.d} fill="none" stroke=${e.stroke} strokeWidth=${e.width} strokeDasharray=${e.dash} markerEnd=${e.marker} />`)}
               </svg>
               ${wv.labels.map(l => h`<div key=${l.key} className="edge-label" style=${{ left: l.x + 'px', top: l.y + 'px', borderColor: l.border, color: l.fg }}>${l.text}</div>`)}
               ${wv.nodes.map(n => h`<div key=${n.id} className="node" onPointerDown=${n.onDown} onKeyDown=${n.onKey} tabIndex="0" role="button" aria-label=${n.aria}
                   style=${{ left: n.x + 'px', top: n.y + 'px', border: n.border, boxShadow: n.shadow, opacity: n.opacity, outline: n.outline }}>
                 <div className="node-head" style=${{ background: n.tbg }}>
-                  <span className="mk" style=${{ width: n.mw, background: n.tc, borderRadius: n.mr, transform: n.mrot }}></span>
+                  <span className="mk" style=${{ width: n.mw, background: n.mc, borderRadius: n.mr, transform: n.mrot }}></span>
                   <span className="type" style=${{ color: n.tc }}>${n.typeLabel}</span>
                   <span className="dot" style=${{ color: n.dotC }}>${n.dot}</span>
                 </div>
@@ -1526,8 +1578,8 @@ function Workflows(wv, pd, canvasRef) {
             </div>
           </div>
           <div className="canvas-hint">
-            <span className="info">Exploration view · drag nodes, scroll to zoom</span>
-            ${wv.moved && h`<span className="warn">Layout changed in this view only — the live workflow is unchanged</span>`}
+            <span className="info">Drag to rearrange · scroll to zoom</span>
+            ${wv.moved && h`<span className="warn">Layout changed here only</span>`}
           </div>
           <div className="zoom">
             <button className="sym" onClick=${wv.zoomOut} aria-label="Zoom out">−</button>
@@ -1535,21 +1587,20 @@ function Workflows(wv, pd, canvasRef) {
             <button className="sym" onClick=${wv.zoomIn} aria-label="Zoom in">+</button>
             <span className="div"></span>
             <button onClick=${wv.fitView}>Fit</button>
-            <button onClick=${wv.resetLayout}>Reset layout</button>
-            <button disabled title="Editing workflow definitions isn’t connected in this prototype">Edit definition</button>
+            ${wv.moved && h`<button onClick=${wv.resetLayout}>Reset layout</button>`}
           </div>
         </div>
         <div className="player">
           <button className="btn-sq" onClick=${wv.prev} aria-label="Previous step">◀</button>
-          <button className="play" onClick=${wv.togglePlay}>${wv.playLabel}</button>
           <button className="next" onClick=${wv.next}>Next step ▶</button>
+          <button className="play" onClick=${wv.togglePlay}>${wv.playLabel}</button>
           <div className="player-status">
-            <div className="top"><span className="no">Step ${wv.stepNo}/${wv.total} · ${wv.stepTime}</span><span className="ti">${wv.stepTitle}</span></div>
+            <div className="top"><span className="no">${wv.stepNo}/${wv.total}</span><span className="ti">${wv.stepTitle}</span></div>
             <div className="dots">
               ${wv.dots.map((d, i) => h`<button key=${i} onClick=${d.go} aria-label=${d.aria} style=${{ background: d.bg }}></button>`)}
             </div>
           </div>
-          <button className="replay" onClick=${wv.replay}>Replay from start</button>
+          <button className="btn-link" onClick=${wv.replay}>Replay</button>
         </div>
       </div>
 
@@ -1560,61 +1611,58 @@ function Workflows(wv, pd, canvasRef) {
 
 function StepPanel(pd) {
   const stp = pd.stp;
-  return h`<aside className="card step-panel">
+  return h`<aside className="card step-panel" aria-label="Selected step">
     <div className="head">
       <span className="type" style=${{ background: pd.tbg, color: pd.tc }}>${pd.typeLabel}</span>
       <span className="status" style=${{ background: pd.stBg, color: pd.stFg }}>${pd.status}</span>
+      ${pd.needsPerson && h`<span className="person-chip">Needs a person</span>`}
       <span className="spacer"></span>
-      ${pd.pinned && h`<button className="btn-link" onClick=${pd.unpin}>Follow current step</button>`}
+      ${pd.pinned && h`<button className="btn-link" onClick=${pd.unpin}>Back to current step</button>`}
     </div>
     <div>
       <div className="title">${pd.title}</div>
       <div className="sub">${pd.sub}</div>
     </div>
-    <div className="kv">
-      <span className="k">Actor</span><span className="v">${pd.actor}</span>
-      <span className="k">System</span><span className="v">${pd.system}</span>
-      <span className="k">Autonomy</span><span><span className="aut" style=${{ background: pd.autBg, color: pd.autFg }}>${pd.autonomy}</span></span>
-    </div>
-    <div className="io">
-      <div><div className="lbl">Inputs</div>${pd.inputs.map(i => h`<div key=${i} className="it">${i}</div>`)}</div>
-      <div><div className="lbl">Outputs</div>${pd.outputs.map(o => h`<div key=${o} className="it">${o}</div>`)}</div>
-    </div>
 
-    <div className="step-detail">
-      <div className="tag">${pd.stepLabel}</div>
-      ${!stp && h`<${Frag}>
-        <div className="unreached">${pd.unreachedText}</div>
-        ${pd.canJump && h`<button className="btn-primary" style=${{ alignSelf: 'flex-start' }} onClick=${pd.jump}>Jump to this step</button>`}
-        ${pd.canSwitch && h`<button className="btn-dark" style=${{ alignSelf: 'flex-start' }} onClick=${pd.switchBranch}>Explore this branch</button>`}<//>`}
-      ${stp && h`<${Frag}>
-        <div className="st">${stp.title}</div>
-        ${stp.decision && h`<div className="why"><b>Why: </b>${stp.decision}</div>`}
-        ${stp.event && h`<div className="event">${stp.event}</div>`}
-        ${pd.msgs.length > 0 && h`<div className="mini-chat">
-          ${pd.msgs.map((m, i) => h`<div key=${i} style=${{ alignSelf: m.align, background: m.bg, borderColor: m.border }}>
-            <div className="who" style=${{ color: m.whoC }}>${m.who}</div>${m.text}
-          </div>`)}
-        </div>`}
-        ${stp.caps && h`<div className="mini-caps">
-          ${pd.caps.map(c => h`<div key=${c.k} className="mark-row"><span className="g" style=${{ color: c.color }}>${c.glyph}</span><span className="spacer">${c.k}</span><span className="n">${c.note}</span></div>`)}
-        </div>`}
-        ${pd.ticket && h`<div className="mini-ticket">
-          <div className="top"><span className="id">${pd.ticket.id} · OI</span>${Pill(pd.ticket.pill, pd.ticket.status)}</div>
-          <span className="ti">${pd.ticket.title}</span>
-          <span className="ow">Owner: ${pd.ticket.owner}</span>
-        </div>`}
-        ${pd.evidence && h`<div className="mini-ev">
-          <div className="top"><span className="ti">Evidence · attempt ${pd.evidence.n}</span><span className="result" style=${{ background: pd.evidence.bg, color: pd.evidence.fg }}>${pd.evidence.result}</span></div>
-          ${pd.evidence.items.map(e => h`<div key=${e.label} className="row">
-            <span className="g" style=${{ color: e.color }}>${e.glyph}</span>
-            <span className="l">${e.label}${e.hasWhy && h`<span className="why-text">${e.why}</span>`}</span>
-          </div>`)}
-          <span className="sim">Simulated vision check · scripted for the demo</span>
-        </div>`}
-        ${stp.prefs && h`<div className="new-prefs">${stp.prefs.map(p => h`<span key=${p}>+ ${p}</span>`)}</div>`}
-        <button className="btn" style=${{ alignSelf: 'flex-start' }} onClick=${pd.open}>${pd.openLabel}</button><//>`}
-    </div>
+    ${!stp && h`<div className="step-detail">
+      <div className="unreached">${pd.unreachedText}</div>
+      ${pd.canJump && h`<button className="btn-primary" style=${{ alignSelf: 'flex-start' }} onClick=${pd.jump}>Jump to this step</button>`}
+      ${pd.canSwitch && h`<button className="btn-dark" style=${{ alignSelf: 'flex-start' }} onClick=${pd.switchBranch}>Explore this branch</button>`}
+    </div>`}
+    ${stp && h`<div className="step-detail">
+      <div className="st">${stp.title}</div>
+      ${stp.decision && h`<div className="why"><b>Why: </b>${stp.decision}</div>`}
+      ${stp.event && h`<div className="event">${stp.event}</div>`}
+      ${pd.msgs.length > 0 && h`<div className="mini-chat">
+        ${pd.msgs.map((m, i) => h`<div key=${i} style=${{ alignSelf: m.align, background: m.bg, borderColor: m.border }}>
+          <div className="who" style=${{ color: m.whoC }}>${m.who}</div>${m.text}
+        </div>`)}
+      </div>`}
+      ${stp.caps && h`<div className="mini-caps">
+        ${pd.caps.map(c => h`<div key=${c.k} className="mark-row"><span className="g" style=${{ color: c.color }}>${c.glyph}</span><span className="spacer">${c.k}</span><span className="n">${c.note}</span></div>`)}
+      </div>`}
+      ${pd.ticket && h`<div className="mini-ticket">
+        <div className="top"><span className="id">${pd.ticket.id}</span>${Pill(pd.ticket.pill, pd.ticket.status)}</div>
+        <span className="ti">${pd.ticket.title}</span>
+        <span className="ow">Operator: ${pd.ticket.owner}</span>
+      </div>`}
+      ${pd.evidence && h`<div className="mini-ev">
+        <div className="top"><span className="ti">Evidence · attempt ${pd.evidence.n}</span><span className="result" style=${{ background: pd.evidence.bg, color: pd.evidence.fg }}>${pd.evidence.result}</span></div>
+        ${pd.evidence.items.map(e => h`<div key=${e.label} className="row">
+          <span className="g" style=${{ color: e.color }}>${e.glyph}</span>
+          <span className="l">${e.label}${e.hasWhy && h`<span className="why-text">${e.why}</span>`}</span>
+        </div>`)}
+        <span className="sim">Simulated vision check</span>
+      </div>`}
+      ${stp.prefs && h`<div className="new-prefs">${stp.prefs.map(p => h`<span key=${p}>+ ${p}</span>`)}</div>`}
+      <div className="next-line"><span className="eyebrow">Next</span> ${pd.next}</div>
+    </div>`}
+
+    <details className="more">
+      <summary>Step details</summary>
+      <div className="more-body"><dl className="facts single">${pd.details.map(([k, v]) => h`<div key=${k}><dt>${k}</dt><dd>${v}</dd></div>`)}</dl></div>
+    </details>
+    ${stp && h`<button className="btn-link" style=${{ alignSelf: 'flex-start' }} onClick=${pd.open}>${pd.openLabel}</button>`}
   </aside>`;
 }
 

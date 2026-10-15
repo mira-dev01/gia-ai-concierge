@@ -65,13 +65,13 @@ const STATUS_PILL = {
   open: ['#E7ECEF', '#3E5263', '○'],
   acknowledged: ['#E7ECEF', '#3E5263', '◐'],
   in_progress: ['#F6EAD5', '#6B440B', '◔'],
-  delayed: ['#F6DCD8', '#9E2E29', '▲'],
+  delayed: ['#F6DCD8', '#A8382A', '▲'],
   closed: ['#E6EEE7', '#2F4A38', '✓']
 };
 export const statusPill = s => { const m = STATUS_PILL[s] || ['#F1EBE6', '#6E6762', '·']; return { bg: m[0], fg: m[1], icon: m[2] }; };
-const SEVERITY = { urgent: ['#9E2E29', '▲'], high: ['#9E2E29', '▲'], medium: ['#94600F', '◆'], low: ['#6E6762', '·'] };
+const SEVERITY = { urgent: ['#A8382A', '▲'], high: ['#A8382A', '▲'], medium: ['#7A4F0C', '◆'], low: ['#6E6762', '·'] };
 const FLOW = ['open', 'acknowledged', 'in_progress', 'closed'];
-const SOURCE_LABEL = { guest: 'Guest via WhatsApp', 'uc-ops-01': 'Pre-arrival check (UC-OPS-01)', system: 'System' };
+const SOURCE_LABEL = { guest: 'Guest via WhatsApp', 'uc-ops-01': 'Pre-arrival check', system: 'System' };
 
 export function ticketView(t, now) {
   const sev = SEVERITY[t.severity] || ['#6E6762', '·'];
@@ -88,7 +88,7 @@ export function ticketView(t, now) {
     timeFlag: timeFlag(t, now),
     resolvedText: t.status === 'closed' && t.resolve_minutes !== null
       ? `Resolved in ${duration(t.resolve_minutes)}${t.resolved_by ? ' by ' + t.resolved_by : ''} · ${t.within_sla ? 'within' : 'over'} SLA` : '',
-    flowItems: list.map((x, i) => ({ label: STATUS_LABEL[x], bg: i <= idx ? (x === 'delayed' ? '#B93832' : i === idx ? '#292725' : '#53735E') : '#E8DDD4', fg: i <= idx ? '#292725' : '#9A918A' })),
+    flowItems: list.map((x, i) => ({ label: STATUS_LABEL[x], bg: i <= idx ? (x === 'delayed' ? '#C2412E' : i === idx ? '#1A1714' : '#53735E') : '#E8DDD4', fg: i <= idx ? '#1A1714' : '#6A625C' })),
     history: t.history.map(h => ({ time: when(h.at, now), title: h.title, text: h.text }))
   };
 }
@@ -97,32 +97,45 @@ export function ticketView(t, now) {
 export function timeFlag(t, now) {
   if (t.status === 'closed') {
     if (t.resolve_minutes === null) return null;
-    return { text: '✓ ' + duration(t.resolve_minutes), color: t.within_sla ? '#2F4A38' : '#9E2E29', bg: t.within_sla ? '#E6EEE7' : '#F6DCD8', title: t.within_sla ? 'Resolved within SLA' : 'Resolved after its SLA' };
+    return { text: '✓ ' + duration(t.resolve_minutes), color: t.within_sla ? '#2F4A38' : '#A8382A', bg: t.within_sla ? '#E6EEE7' : '#F6DCD8', title: t.within_sla ? 'Resolved within SLA' : 'Resolved after its SLA' };
   }
   const open = duration(minutesBetween(t.created_at, now));
   return t.overdue
-    ? { text: 'Open ' + open, color: '#9E2E29', bg: '#F6DCD8', title: 'Past its expected time' }
+    ? { text: 'Open ' + open, color: '#A8382A', bg: '#F6DCD8', title: 'Past its expected time' }
     : { text: 'Open ' + open, color: '#6B440B', bg: '#FBF3E4', title: 'Open' };
 }
 
 // ---------- needs a person ----------
 
-// Waiting handoffs and tickets that are late, delayed or urgent: everything a person should look at now.
+// Everything a person should act on now, most urgent first: guests waiting for a person, then open tickets that are
+// urgent, overdue, delayed or have no operator. Each item says what state it's in and the next thing to do.
+// Overview's list and the navigation badges both come from here, so their counts always agree.
 export function attention(live) {
   const items = [];
   live.handoffs.filter(h => h.status === 'waiting').forEach(h => items.push({
-    key: 'HO-' + h.id, kind: 'handoff', booking: h.booking_id, urgent: h.urgency === 'urgent',
-    title: h.reason, meta: [`HO-${h.id}`, h.villa, h.guest].filter(Boolean).join(' · '),
-    reason: h.urgency === 'urgent' ? 'Urgent handoff · a person must take over' : 'Handoff · waiting for a person',
-    icon: h.urgency === 'urgent' ? '▲' : '!'
+    key: 'HO-' + h.id, kind: 'handoff', booking: h.booking_id, villa: h.villa, at: h.at,
+    urgent: h.urgency === 'urgent', rank: h.urgency === 'urgent' ? 0 : 1,
+    title: h.reason, who: [h.guest, h.villa].filter(Boolean).join(' · '), ref: `HO-${h.id}`,
+    state: h.urgency === 'urgent' ? 'Urgent · needs a person' : 'Waiting for a person', tone: 'red',
+    action: 'Take over chat'
   }));
-  live.tickets.filter(t => t.status !== 'closed' && (t.overdue || t.status === 'delayed' || t.severity === 'urgent')).forEach(t => items.push({
-    key: t.ref, kind: 'ticket', ref: t.ref, urgent: t.severity === 'urgent',
-    title: t.summary, meta: [t.ref, t.villa, t.assignee.split(/[,·(]/)[0].trim()].join(' · '),
-    reason: t.status === 'delayed' ? 'Marked delayed' : t.overdue ? `Past its expected time (${whenFull(t.due_at, live.now)})` : 'Urgent ticket',
-    icon: '▲'
-  }));
-  return items.sort((a, b) => (b.urgent ? 1 : 0) - (a.urgent ? 1 : 0));
+  live.tickets.filter(t => t.status !== 'closed').forEach(t => {
+    const unassigned = !t.operator_id;
+    const reasons = [t.severity === 'urgent' && 'Urgent', t.overdue && 'Overdue', t.status === 'delayed' && 'Delayed',
+      unassigned && 'Unassigned'].filter(Boolean);
+    if (!reasons.length) return;
+    items.push({
+      key: t.ref, kind: 'ticket', ref: t.ref, booking: t.booking_id, villa: t.villa, at: t.created_at,
+      urgent: t.severity === 'urgent',
+      rank: t.severity === 'urgent' ? 0 : t.overdue ? 2 : t.status === 'delayed' ? 3 : 4,
+      title: t.summary, who: [t.guest, t.villa].filter(Boolean).join(' · '),
+      state: reasons.join(' · ') + (t.overdue ? ` · was due ${whenFull(t.due_at, live.now)}` : ''),
+      tone: t.severity === 'urgent' || t.overdue || t.status === 'delayed' ? 'red' : 'amber',
+      status: STATUS_LABEL[t.status] || titleCase(t.status), pill: statusPill(t.status),
+      action: unassigned ? 'Assign operator' : 'Update progress'
+    });
+  });
+  return items.sort((a, b) => a.rank - b.rank || a.at.localeCompare(b.at));
 }
 
 // ---------- a booking's conversation, profile and activity ----------
@@ -147,7 +160,7 @@ export function chatItems(b, tickets, now, openTicket) {
       .forEach(h => events.push({ at: h.at, kind: 'chip', text: h.title.replace('→', '·'), go: () => openTicket(t.ref) }));
   });
   const NOTES = { ops_takeover: 'Ops took over this chat · Gia paused', ops_handback: 'Handed back to Gia', handoff_raised: null };
-  b.activity.forEach(a => {
+  b.activity.slice().reverse().forEach(a => {  // activity is newest first; notes go in oldest first
     if (!(a.action in NOTES)) return;
     events.push({ at: a.at, kind: 'note', text: NOTES[a.action] || `Gia asked for a person · ${a.text}` });
   });
@@ -163,13 +176,13 @@ export function chatItems(b, tickets, now, openTicket) {
 }
 
 const STEP_STATE = {
-  read: ['✓', '#53735E'], delivered: ['✓', '#53735E'], sent: ['◔', '#94600F'], scheduled: ['○', '#9A918A'],
-  failed: ['✕', '#B93832'], skipped: ['–', '#9A918A'], cancelled: ['–', '#9A918A']
+  read: ['✓', '#53735E'], delivered: ['✓', '#53735E'], sent: ['◔', '#7A4F0C'], scheduled: ['○', '#6A625C'],
+  failed: ['✕', '#C2412E'], skipped: ['–', '#6A625C'], cancelled: ['–', '#6A625C']
 };
 
 export function journeyRows(b, now) {
   return b.journey.map(j => {
-    const st = STEP_STATE[j.status] || ['·', '#9A918A'];
+    const st = STEP_STATE[j.status] || ['·', '#6A625C'];
     const at = { scheduled: j.due_at, sent: j.sent_at, delivered: j.delivered_at, read: j.read_at }[j.status];
     return { k: j.step, glyph: st[0], color: st[1], note: titleCase(j.status) + (at ? ' · ' + whenFull(at, now) : '') + (j.note && j.status !== 'scheduled' ? ` (${j.note})` : '') };
   });

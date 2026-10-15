@@ -232,7 +232,7 @@ def _activity(entry: dict, names: dict) -> dict:
         who, title, text = "human", f"{d.get('from')} (operator) wrote", d.get("text", "")
     elif action in ("villa_staff_assigned", "uc_ops_01_settings"):
         who = "human"
-        title = "Villa staff assigned" if action == "villa_staff_assigned" else "UC-OPS-01 settings changed"
+        title = "Villa staff assigned" if action == "villa_staff_assigned" else "Pre-arrival settings changed"
         text = ", ".join(d.get("villas") or [])
 
     return {"at": entry["at"], "booking_id": entry["booking_id"], "action": action, "who": who, "title": title,
@@ -284,7 +284,7 @@ def _event(entry: dict, names: dict, by_ref: dict, villas: dict) -> dict | None:
         return {**ev, "kind": "ticket", "title": f"{t['ref']} reassigned", "text": f"{t['summary']} · to {d.get('to')}"}
     if action.startswith("uc_ops_01:"):
         step = scheduler.STEP_LABELS.get(action.split(":", 1)[1], "Pre-arrival")
-        return {**ev, "kind": "journey", "title": f"{step} message sent to {guest}", "text": "UC-OPS-01 pre-arrival journey"}
+        return {**ev, "kind": "journey", "title": f"{step} message sent to {guest}", "text": "Pre-arrival message"}
     if action == "save_arrival_details":
         fields = ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in d.items() if v not in (None, "", []))
         return {**ev, "kind": "profile", "title": f"Arrival details captured for {guest}", "text": fields}
