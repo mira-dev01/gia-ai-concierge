@@ -270,7 +270,7 @@ async def _send(booking: dict, name: str, merged: bool) -> tuple[str | None, str
         if text:
             try:
                 wa_message_id = whatsapp.message_id(await whatsapp.send_text(phone, text))
-                _log_sent(booking, name, text, "free_text", None, merged)
+                _log_sent(booking, name, text, "free_text", None, merged, wa_message_id)
                 return wa_message_id, "free_text", None
             except whatsapp.WhatsAppError as e:
                 if e.code != whatsapp.OUTSIDE_SERVICE_WINDOW:
@@ -281,7 +281,7 @@ async def _send(booking: dict, name: str, merged: bool) -> tuple[str | None, str
     result, text, sent_as = await wa_templates.send(phone, template, values, booking.get("language") or "en")
     wa_message_id = whatsapp.message_id(result)
     agent.record_outbound(phone, bid, text)
-    _log_sent(booking, name, text, "template", sent_as, merged)
+    _log_sent(booking, name, text, "template", sent_as, merged, wa_message_id)
     return wa_message_id, "template", sent_as
 
 
@@ -302,9 +302,11 @@ def _template_for(booking: dict, name: str, merged: bool) -> tuple[wa_templates.
                                   villa.get("maps_url"), contact.get("name"), contact.get("phone")]
 
 
-def _log_sent(booking: dict, name: str, text: str, channel: str, template: str | None, merged: bool) -> None:
-    """Every UC-OPS-01 message is logged against the booking, as the guest saw it."""
-    store.log_message(booking["guest_phone"], booking["booking_id"], "out", text)
+def _log_sent(booking: dict, name: str, text: str, channel: str, template: str | None, merged: bool,
+              wa_message_id: str | None) -> None:
+    """Every UC-OPS-01 message is logged against the booking, as the guest saw it, with its delivery state."""
+    store.log_message(booking["guest_phone"], booking["booking_id"], "out", text,
+                      status="sent" if wa_message_id else "not_sent", wa_message_id=wa_message_id)
     store.audit(booking["booking_id"], f"uc_ops_01:{name}", "tier0",
                 {"channel": channel, "template": template, "merged_t7": merged})
 

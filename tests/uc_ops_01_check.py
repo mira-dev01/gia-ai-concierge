@@ -11,7 +11,7 @@ import tempfile
 from datetime import datetime
 
 tmp = tempfile.mkdtemp()
-os.environ.update(DATABASE_URL=os.environ.get("TEST_DATABASE_URL", ""), DB_PATH=f"{tmp}/t.db", DRY_RUN="true", ADMIN_PASSWORD="pw", OI_WEBHOOK_SECRET="s3",
+os.environ.update(DATABASE_URL=os.environ.get("TEST_DATABASE_URL", ""), DB_PATH=f"{tmp}/t.db", DRY_RUN="true", WA_TEMPLATES_LIVE="false", ADMIN_PASSWORD="pw", OI_WEBHOOK_SECRET="s3",
                   GROQ_API_KEY=os.environ.get("GROQ_API_KEY") or "dummy", DEMO_BOOKING_ID="", TICKET_EMAIL_TO="hello@hostwithmira.com", RESEND_API_KEY="")
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 
@@ -79,7 +79,7 @@ async def main():
     check("t7_reminder" in s17, "reminder scheduled after merged welcome")
     check(steps("LH-24021")["welcome"][0] == "sent", "LH-24021 welcome sent")
     tr = [m for m in store.transcript() if m["booking_id"] == "LH-24017"]
-    check(tr and "As your stay is coming up soon" in tr[-1]["body"], "transcript has the real template text")
+    check(tr and "Let's get your stay ready" in tr[-1]["body"], "transcript has the real template text")
     # run again: no double send
     n = len(sent)
     await scheduler.run_once()
@@ -110,7 +110,7 @@ async def main():
     box = store.outbox()
     check(box and box[0]["status"] == "logged" and box[0]["to_addr"] == "hello@hostwithmira.com", f"ticket email queued+logged {box[0]['status'] if box else None}")
     t1_text = [m for m in store.transcript() if m["booking_id"] == "LH-24017"][-1]["body"]
-    check("Ravi Caretaker, 919999000001" in t1_text and "maps.google" in t1_text, "T-1 has caretaker contact and map")
+    check("Ravi Caretaker * · *919999000001" in t1_text and "maps.google" in t1_text, "T-1 has caretaker contact and map")
 
     # LH-24021: guest replies after T-7 -> reminder skipped; free text when window open
     at(2026, 10, 17, 10, 0)
@@ -188,7 +188,7 @@ async def main():
     await scheduler.run_once()
     await scheduler.run_once()
     body = [m["body"] for m in store.transcript() if m["booking_id"] == "LH-30004"]
-    check(len(body) == 2 and "As your stay is coming up soon" in body[0] and "Check-in is from" in body[1],
+    check(len(body) == 2 and "Let's get your stay ready" in body[0] and "Check-in: *" in body[1],
           "merged welcome, then T-1")
     await scheduler.run_once()
     check(steps("LH-30004").get("t7_reminder", ("",))[0] in ("scheduled", "skipped"), "no reminder sent after T-1")

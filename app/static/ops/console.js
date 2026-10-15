@@ -1,35 +1,36 @@
 // Gia ops console: Lohono's AI-native guest operations.
-// Overview, Guest Journeys and Operations run on live data from the backend (live.js): bookings,
-// WhatsApp conversations, tickets, handoffs and the audit log, refreshed every few seconds. Ticket status
-// changes, takeovers, ops replies and handoff resolution are real actions.
+// Four areas: Overview (what needs a person now), Properties (each villa's stay, readiness, team and guest
+// conversation), Operations (the ticket queue) and Workflows (scripted scenarios). Live data comes from the backend
+// (live.js), refreshed every few seconds by one sync loop; Properties, conversations, tickets and operators load
+// their details when opened. Every action is a real backend call.
 // The guided demo scenarios (data.js) stay alongside, tagged "Demo": the concierge journey, the field app's
 // photo-evidence flow and the workflow explorer, which have no live counterpart yet.
 import * as D from './data.js';
 import * as L from './live.js';
+import { h, Frag, Pill, LiveTag, DemoChip, PresenceChip, ChatItem, AttentionList, Composer, stickToBottom } from './ui.js';
+import { PropertiesWorkspace, EMPTY_QUERY } from './properties.js';
+import { OperationsWorkspace, OperatorDrawer, AddOperator, DemoTicketDetail, EMPTY_FILTERS, demoRow } from './operations.js';
 
-const { React, ReactDOM, htm } = window;
-const h = htm.bind(React.createElement);
-const Frag = React.Fragment;
+const { React, ReactDOM } = window;
 
-const STORAGE_KEY = 'gia-ops-v2';
-const SAVED_KEYS = ['view', 'cStep', 'fStep', 'cBranch', 'fBranch', 'booking', 'fTicket', 'wf', 'gTab', 'gTicket'];
-const DEMO = 'demo';           // the scripted demo booking in Guest Journeys
+const STORAGE_KEY = 'gia-ops-v3';
+const SAVED_KEYS = ['view', 'pNav', 'pQuery', 'oSel', 'oFilters', 'cStep', 'fStep', 'cBranch', 'fBranch', 'wf', 'gTab', 'gTicket'];
+const VIEWS = ['overview', 'properties', 'operations', 'workflows', 'demo'];
 const DEMO_FIELD_TICKET = 'OI-5534';
 const POLL_MS = 5000;          // how often live data is refreshed
 const AUTO_STEP_MS = 1300;     // pause between the steps a phone action triggers
 const PLAY_STEP_MS = 1700;     // pause between steps when the workflow is playing
 const MIN_ZOOM = 0.3, MAX_ZOOM = 1.8;
 const ALL = 'all';
-const VIEW_LABEL = { overview: 'Overview', guests: 'Guest journeys', field: 'Operations', workflows: 'Workflows' };
+const VIEW_LABEL = { overview: 'Overview', properties: 'Properties', operations: 'Operations', workflows: 'Workflows', demo: 'Demo guest journey' };
 const ATTENTION_SHOWN = 5;     // Overview lists this many items needing attention before "View all"
 const ACTIVITY_SHOWN = 6;
 
-const ownerName = owner => owner.split(' · ')[0];
 const stepsFor = (wf, s) => wf === 'concierge' ? D.conciergeSteps(s.cBranch) : D.fieldSteps(s.fBranch);
 const stepKey = wf => wf === 'concierge' ? 'cStep' : 'fStep';
-const STAGE_COLORS = { 'In stay': ['#F9E6DF', '#A8382A'], 'Pre-arrival': ['#E7ECEF', '#3E5263'], 'Post-stay': ['#F1EBE6', '#6E6762'], 'Cancelled': ['#F1EBE6', '#6A625C'] };
-const EMPTY_LIVE = { now: '', bookings: [], tickets: [], handoffs: [], events: [], villas: [], ticket_statuses: [], operators: [], operator_roles: [] };
+const EMPTY_LIVE = { now: '', bookings: [], tickets: [], handoffs: [], events: [], villas: [], ticket_statuses: [], operators: [], operator_roles: [], attention: [] };
 const EMPTY_FORM = { name: '', phone: '', role: 'caretaker', villa_ids: [], presence: 'onsite' };
+const EMPTY_NAV = { villa: null, booking: null, tab: 'overview', pane: 'profile' };
 const TOAST_MS = 8000, URGENT_TOAST_MS = 15000;
 // Live activity badges: [label, text colour, background].
 const EVENT_KINDS = {
@@ -41,26 +42,30 @@ const EVENT_KINDS = {
 class OpsConsole extends React.Component {
   canvasRef = React.createRef();
   chatRef = React.createRef();
-  phoneRef = React.createRef();
+  chatScroll = {};
   timers = [];
   acted = new Map();  // ticket ref -> when this console changed it, so its own change doesn't pop up as news
   state = this.initialState(true);
 
   initialState(useSaved) {
     const d = {
-      view: 'overview', cStep: 8, fStep: 6, cBranch: 'yes', fBranch: 'accept', booking: null, gTab: 'tickets', gTicket: null,
-      fTicket: null, fOperator: null, fVilla: ALL, fCat: ALL, fOp: ALL, fStatus: 'active', fMore: false,
+      view: 'overview', cStep: 8, fStep: 6, cBranch: 'yes', fBranch: 'accept', gTab: 'tickets', gTicket: null,
+      pNav: EMPTY_NAV, pQuery: EMPTY_QUERY, oSel: null, oFilters: EMPTY_FILTERS, opDrawer: null,
       ovVilla: ALL, ovAll: false, ovActivity: false,
-      wf: 'concierge', sel: null, search: '', z: 0.75, px: 30, py: 30, playing: false, cap: {},
-      demoTakeover: false, demoOps: [], draft: '', opDraft: '', adding: false, opForm: EMPTY_FORM, eventToasts: [],
+      wf: 'concierge', sel: null, z: 0.75, px: 30, py: 30, playing: false, cap: {},
+      demoTakeover: false, demoOps: [], draft: '', adding: false, opForm: EMPTY_FORM, eventToasts: [],
       moved: { concierge: false, field: false },
       pos: { concierge: D.defaultPositions('concierge'), field: D.defaultPositions('field') },
-      live: null, liveError: null, pending: {}, notice: null, back: null
+      live: null, liveError: null, lastOk: null, tick: 0, pending: {}, notice: null, back: null
     };
     if (useSaved) {
       try {
         const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
-        if (saved) SAVED_KEYS.forEach(k => { if (saved[k] !== undefined) d[k] = saved[k]; });
+        if (saved) SAVED_KEYS.forEach(k => { if (saved[k] !== undefined && saved[k] !== null) d[k] = saved[k]; });
+        if (!VIEWS.includes(d.view)) d.view = 'overview';
+        d.pNav = { ...EMPTY_NAV, ...d.pNav };
+        d.pQuery = { ...EMPTY_QUERY, ...d.pQuery };
+        d.oFilters = { ...EMPTY_FILTERS, ...d.oFilters };
       } catch (e) { /* storage unavailable: start fresh */ }
     }
     return d;
@@ -103,17 +108,7 @@ class OpsConsole extends React.Component {
       this.needFit = true;
     }
     if (el && this.needFit) { this.needFit = false; setTimeout(() => this.fit(), 0); }
-
-    const chat = this.chatRef.current;
-    if (chat) {
-      const key = this.state.booking + ':' + chat.scrollHeight;
-      if (key !== this.chatKey) { this.chatKey = key; chat.scrollTop = chat.scrollHeight; }
-    }
-    const phone = this.phoneRef.current;
-    if (phone) {
-      const key = phone.dataset.who + ':' + phone.scrollHeight;
-      if (key !== this.phoneKey) { this.phoneKey = key; phone.scrollTop = phone.scrollHeight; }
-    }
+    if (this.chatRef.current) stickToBottom(this.chatRef.current, 'demo:' + this.chatRef.current.childElementCount, this.chatScroll);
 
     const s = this.state;
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(Object.fromEntries(SAVED_KEYS.map(k => [k, s[k]])))); } catch (e) { /* not persisted */ }
@@ -121,13 +116,15 @@ class OpsConsole extends React.Component {
 
   // ---------- live data and actions ----------
 
+  // The one sync loop: the portfolio snapshot every few seconds. Each successful sync bumps `tick`, and the open
+  // property, conversation, ticket or operator reloads its own details on that tick (nothing else polls).
   refresh = async () => {
     if (this.refreshing) return;
     this.refreshing = true;
     try {
       const live = await L.api('GET', '/state');
       this.announce(live.events);
-      this.setState({ live, liveError: null });
+      this.setState(s => ({ live, liveError: null, lastOk: live.now, tick: s.tick + 1 }));
     } catch (e) {
       this.setState({ liveError: e.message });
     } finally {
@@ -157,83 +154,65 @@ class OpsConsole extends React.Component {
     this.noticeTimer = setTimeout(() => this.setState({ notice: null }), tone === 'error' ? 9000 : 4500);
   }
 
-  // Runs one backend action, shows the outcome, then refreshes so every screen reflects it.
-  async act(key, request, success) {
-    if (this.state.pending[key]) return false;
+  // Runs one backend action (never twice at once for the same key), confirms the outcome, then syncs so every
+  // screen shows it. Returns { ok, result } or { ok: false, error }; quiet leaves showing a failure to the caller.
+  async act(key, request, success, opts = {}) {
+    if (this.state.pending[key]) return { ok: false, error: 'Already in progress' };
     this.setState(s => ({ pending: { ...s.pending, [key]: true } }));
     try {
       const result = await request();
       if (success) this.notify(success(result));
       await this.refresh();
-      return true;
+      return { ok: true, result };
     } catch (e) {
-      this.notify(e.message, 'error');
-      return false;
+      if (!opts.quiet) this.notify(e.message, 'error');
+      return { ok: false, error: e.message };
     } finally {
       this.setState(s => { const pending = { ...s.pending }; delete pending[key]; return { pending }; });
     }
   }
 
-  // Acting on a ticket keeps it selected, so its outcome stays in view even if it no longer leads the list.
-  pin(t) { if (this.state.fTicket !== t.ref) this.setState({ fTicket: t.ref, fOperator: null }); }
-
-  setTicketStatus(t, status) {
-    this.pin(t);
-    this.acted.set(t.ref, Date.now());
-    return this.act('ticket:' + t.id, () => L.api('POST', `/tickets/${t.id}/status`, { status }),
-      r => `${r.ref} is now ${L.STATUS_LABEL[r.status].toLowerCase()}` + (r.guest_messaged ? '. Gia messaged the guest on WhatsApp.' : '. Internal ticket, so the guest wasn’t messaged.'));
-  }
-
-  setTakeover(b, on) {
-    return this.act('takeover:' + b.id, () => L.api('POST', `/bookings/${encodeURIComponent(b.id)}/takeover`, { on }),
-      () => on ? `You’re handling ${b.name}’s chat. Gia is paused.` : `Handed back. Gia is replying to ${b.name} again.`);
-  }
-
-  async sendReply(b) {
-    const text = this.state.draft.trim();
-    if (!text) return;
-    const ok = await this.act('reply:' + b.id, () => L.api('POST', `/bookings/${encodeURIComponent(b.id)}/reply`, { text }),
-      () => `Sent to ${b.name} on WhatsApp.`);
-    if (ok) this.setState({ draft: '' });
-  }
-
-  resolveHandoff(ho) {
-    return this.act('handoff:' + ho.id, () => L.api('POST', `/handoffs/${ho.id}/resolve`), () => `HO-${ho.id} marked resolved.`);
-  }
-
-  markDone(t) {
-    if (t.notifies_guest && !window.confirm(`Mark ${t.ref} done for ${t.operator}? Gia will tell ${t.guest || 'the guest'} it’s done.`)) return;
-    this.pin(t);
-    this.acted.set(t.ref, Date.now());
-    return this.act('done:' + t.id, () => L.api('POST', `/tickets/${t.id}/done`),
-      r => `${r.ref} done · resolved in ${L.duration(r.minutes)}` + (r.guest_messaged ? '. Gia told the guest.' : '.'));
-  }
-
-  assignTicket(t, operatorId) {
-    this.pin(t);
-    this.acted.set(t.ref, Date.now());
-    return this.act('assign:' + t.id, () => L.api('POST', `/tickets/${t.id}/assign`, { operator_id: operatorId }),
-      r => `${t.ref} → ${r.assignee}` + (operatorId ? '. They’ve been sent the task on WhatsApp.' : '.'));
-  }
-
-  setPresence(op, presence) {
-    return this.act('presence:' + op.id, () => L.api('POST', `/operators/${op.id}/presence`, { presence }), () => `${op.name} is now ${presence}.`);
-  }
-
-  async messageOperator(op) {
-    const text = this.state.opDraft.trim();
-    if (!text) return;
-    const ok = await this.act('opmsg:' + op.id, () => L.api('POST', `/operators/${op.id}/message`, { text }), () => `Sent to ${op.name} on WhatsApp.`);
-    if (ok) this.setState({ opDraft: '' });
-  }
-
   async addOperator() {
     const f = this.state.opForm;
-    const ok = await this.act('addop', () => L.api('POST', '/operators', f), r => {
-      this.setState({ fOperator: r.id, fTicket: null });
-      return `${f.name.trim()} added as ${L.ROLE_LABEL[f.role].toLowerCase()} (${f.presence}).`;
-    });
-    if (ok) this.setState({ adding: false, opForm: EMPTY_FORM });
+    const r = await this.act('addop', () => L.api('POST', '/operators', f),
+      () => `${f.name.trim()} added as ${L.ROLE_LABEL[f.role].toLowerCase()} (${f.presence}).`);
+    if (r.ok) this.setState({ adding: false, opForm: EMPTY_FORM });
+  }
+
+  // ---------- moving between areas ----------
+
+  // Going from one area to another remembers where you came from, so you can go back; each area keeps its own
+  // filters, selection and scroll while you're away.
+  go(view, patch) {
+    this.stopPlay();
+    if (view === 'workflows') this.needFit = true;
+    this.setState(st => ({ view, back: view !== st.view ? st.view : st.back, ...(patch ? patch(st) : {}) }));
+  }
+
+  navigator() {
+    const live = this.state.live || EMPTY_LIVE;
+    const openProperty = (villa, extra = {}) => this.go('properties', st => ({
+      pNav: { ...st.pNav, villa, booking: extra.booking || null, pane: extra.pane || 'profile', tab: extra.tab || st.pNav.tab }
+    }));
+    return {
+      openProperty,
+      openConversation: bookingId => {
+        const b = live.bookings.find(x => x.id === bookingId);
+        if (!b) { this.notify(`Booking ${bookingId} isn’t in the current data.`, 'error'); return; }
+        openProperty(b.villa_id, { booking: bookingId, pane: 'chat' });
+      },
+      // Open a ticket in Operations; if the current filters would hide it, show the view it belongs to instead.
+      openTicket: ref => this.go('operations', st => {
+        const t = live.tickets.find(x => x.ref === ref);
+        const visible = !t || (st.oFilters.view === 'all' || (st.oFilters.view === 'resolved') === (t.status === 'closed'))
+          && !st.oFilters.q && !st.oFilters.villa && !st.oFilters.priority && !st.oFilters.op && !st.oFilters.status && !st.oFilters.cat
+          && (st.oFilters.view !== 'overdue' || t.overdue) && (st.oFilters.view !== 'unassigned' || !t.operator_id) && (st.oFilters.view !== 'escalated' || t.escalated);
+        return { oSel: ref, oFilters: visible ? st.oFilters : { ...EMPTY_FILTERS, view: t.status === 'closed' ? 'resolved' : 'open' } };
+      }),
+      openOps: patch => this.go('operations', () => ({ oFilters: { ...EMPTY_FILTERS, ...patch } })),
+      openOperator: id => this.setState({ opDrawer: id }),
+      addOperator: villaId => this.setState({ adding: true, opForm: { ...EMPTY_FORM, villa_ids: villaId ? [villaId] : [] } })
+    };
   }
 
   // ---------- canvas: zoom, pan, drag ----------
@@ -333,12 +312,11 @@ class OpsConsole extends React.Component {
     this.clearTimers();
     this.stopPlay();
     const d = this.initialState(false);
-    const keep = ['view', 'booking', 'fTicket', 'fOperator', 'gTab', 'gTicket', 'fVilla', 'fCat', 'fOp', 'fStatus', 'fMore', 'search', 'draft',
-      'ovVilla', 'ovAll', 'ovActivity',
-      'opDraft', 'adding', 'opForm', 'eventToasts', 'live', 'liveError', 'pending', 'notice'];
-    keep.forEach(k => { d[k] = this.state[k]; });
+    const reset = ['cStep', 'fStep', 'cBranch', 'fBranch', 'cap', 'demoTakeover', 'demoOps', 'draft', 'gTab', 'gTicket', 'sel', 'moved', 'pos', 'z', 'px', 'py', 'playing'];
+    const next = {};
+    reset.forEach(k => { next[k] = d[k]; });
     this.needFit = true;
-    this.setState(d);
+    this.setState(next);
     this.notify('Demo scenarios reset. Live data is unchanged.');
   }
 
@@ -347,171 +325,144 @@ class OpsConsole extends React.Component {
   viewModel() {
     const s = this.state;
     const live = s.live || EMPTY_LIVE, now = live.now, loaded = !!s.live;
-    // Following a link from one screen to another remembers the screen you came from, so you can go back to it.
-    const go = (view, extra) => {
-      this.stopPlay();
-      if (view === 'workflows') this.needFit = true;
-      this.setState(st => ({ view, back: view !== st.view ? st.view : st.back, ...(extra || {}) }));
+    const nav = this.navigator();
+    const navTo = view => { this.stopPlay(); if (view === 'workflows') this.needFit = true; this.setState({ view, back: null }); };
+    const sync = { loaded, error: s.liveError, at: now ? now.slice(11, 19) : '', lastOk: s.lastOk ? L.whenFull(s.lastOk, s.lastOk) : '', stale: loaded && !!s.liveError };
+    const ctx = {
+      ...nav, now, tick: s.tick, sync, stale: sync.stale, pending: s.pending,
+      act: (key, request, success, opts) => this.act(key, request, success, opts),
+      notify: (text, tone) => this.notify(text, tone),
+      markActed: ref => this.acted.set(ref, Date.now())
     };
-    const navTo = view => {
-      this.stopPlay();
-      if (view === 'workflows') this.needFit = true;
-      this.setState({ view, back: null });
-    };
-    const toFlow = wf => go('workflows', { wf, sel: null });
 
     // ---- demo scenarios ----
     const cS = D.conciergeSteps(s.cBranch), fS = D.fieldSteps(s.fBranch);
     const cCur = Math.min(s.cStep, cS.length - 1), fCur = Math.min(s.fStep, fS.length - 1);
     const demoTickets = D.scenarioTickets(cS, cCur, fS, fCur);
-    const demoB = D.demoBooking(cCur);
     const scenarioNav = wf => {
       const steps = wf === 'concierge' ? cS : fS, cur = wf === 'concierge' ? cCur : fCur;
-      return { no: cur + 1, total: steps.length, title: steps[cur].title, prev: () => this.setStep(wf, cur - 1), next: () => this.setStep(wf, cur + 1), flow: () => toFlow(wf) };
+      return { no: cur + 1, total: steps.length, title: steps[cur].title, prev: () => this.setStep(wf, cur - 1), next: () => this.setStep(wf, cur + 1), flow: () => this.go('workflows', () => ({ wf, sel: null })) };
+    };
+    const decorated = demoTickets.map(t => D.decorateTicket(t));
+    const demoOps = {
+      rows: decorated.map(demoRow),
+      detail: id => {
+        const t = decorated.find(x => x.id === id);
+        return t ? DemoTicketDetail(t, scenarioNav('field'), t.id === DEMO_FIELD_TICKET ? this.demoPhone(fS, fCur) : null) : null;
+      }
     };
 
-    // ---- live ----
-    const tickets = live.tickets.map(t => L.ticketView(t, now));
-    const ticketByRef = Object.fromEntries(tickets.map(t => [t.ref, t]));
-    const bookings = L.sortBookings(live.bookings);
-    const openCount = id => live.tickets.filter(t => t.booking_id === id && t.status !== 'closed').length;
-    const openText = n => n ? n + ' open ticket' + (n > 1 ? 's' : '') : 'No open tickets';
-    const attention = L.attention(live).map(a => ({
-      ...a, go: a.kind === 'handoff' ? () => go('guests', { booking: a.booking }) : () => go('field', { fTicket: a.ref, fOperator: null })
+    // ---- what needs a person: decided by the backend, shared with Properties and the badges ----
+    const attention = live.attention.map(a => ({
+      ...a, go: a.kind === 'ticket' ? () => nav.openTicket(a.ref)
+        : a.kind === 'booking' ? () => nav.openProperty(a.villa_id)
+        : () => nav.openConversation(a.booking_id)
     }));
     const waitingHandoffs = live.handoffs.filter(x => x.status === 'waiting');
     const ticketAlerts = attention.filter(a => a.kind === 'ticket').length;
-
-    const nav = [['overview', 'Overview'], ['guests', 'Guest Journeys'], ['field', 'Operations'], ['workflows', 'Workflows']].map(([id, label]) => ({
-      id, label: label, on: s.view === id, diamond: id === 'workflows',
-      badge: id === 'guests' ? waitingHandoffs.length : id === 'field' ? ticketAlerts : 0, go: () => navTo(id)
+    const nav4 = [['overview', 'Overview'], ['properties', 'Properties'], ['operations', 'Operations'], ['workflows', 'Workflows']].map(([id, label]) => ({
+      id, label, on: s.view === id || (id === 'workflows' && s.view === 'demo'), diamond: id === 'workflows',
+      badge: id === 'properties' ? waitingHandoffs.length : id === 'operations' ? ticketAlerts : 0,
+      badgeLabel: id === 'properties' ? 'guests waiting for a person' : 'tickets needing attention',
+      go: () => navTo(id)
     }));
 
-    const sync = { loaded, error: s.liveError, at: now ? now.slice(11, 19) : '' };
-
     // ---- overview: what needs a person first, then who's here, then what happened ----
-    const inVilla = name => s.ovVilla === ALL || name === s.ovVilla;
-    const ovAttention = attention.filter(a => inVilla(a.villa));
-    const inStay = bookings.filter(b => b.stage === 'In stay' && inVilla(b.villa));
-    const open = live.tickets.filter(t => t.status !== 'closed' && inVilla(t.villa));
+    const inVilla = id => s.ovVilla === ALL || id === s.ovVilla;
+    const bookings = L.sortBookings(live.bookings);
+    const ovAttention = attention.filter(a => inVilla(a.villa_id));
+    const inStay = bookings.filter(b => b.stage === 'In stay' && inVilla(b.villa_id));
+    const open = live.tickets.filter(t => t.status !== 'closed' && inVilla(t.villa_id));
     const late = open.filter(t => t.overdue);
+    const openCount = id => live.tickets.filter(t => t.booking_id === id && t.status !== 'closed').length;
+    const villaFilter = s.ovVilla === ALL ? '' : s.ovVilla;
     const ov = {
       date: now ? L.longDate(now) : '', loaded,
-      villa: { value: s.ovVilla, options: [[ALL, 'All villas']].concat(live.villas.map(v => [v.name, v.name])), onChange: e => this.setState({ ovVilla: e.target.value, ovAll: false }) },
+      villa: { value: s.ovVilla, options: [[ALL, 'All properties']].concat(live.villas.map(v => [v.id, v.name])), onChange: e => this.setState({ ovVilla: e.target.value, ovAll: false }) },
       metrics: [
         { key: 'attn', label: 'need attention', value: ovAttention.length, tone: ovAttention.length ? 'red' : '', go: () => this.setState({ ovAll: true }) },
-        { key: 'late', label: 'overdue', value: late.length, tone: late.length ? 'red' : '', go: () => go('field', { fStatus: 'overdue', fVilla: s.ovVilla }) },
-        { key: 'open', label: 'open tickets', value: open.length, go: () => go('field', { fStatus: 'active', fVilla: s.ovVilla }) },
-        { key: 'stay', label: 'in stay', value: inStay.length, go: () => go('guests') }
+        { key: 'late', label: 'overdue', value: late.length, tone: late.length ? 'red' : '', go: () => nav.openOps({ view: 'overdue', villa: villaFilter }) },
+        { key: 'open', label: 'open tickets', value: open.length, go: () => nav.openOps({ view: 'open', villa: villaFilter }) },
+        { key: 'stay', label: 'guests in stay', value: inStay.length, go: () => this.go('properties', st => ({ pNav: { ...st.pNav, villa: null }, pQuery: { ...EMPTY_QUERY, sort: st.pQuery.sort } })) }
       ].map(m => ({ ...m, value: loaded ? m.value : '–' })),
-      attention: (s.ovAll ? ovAttention : ovAttention.slice(0, ATTENTION_SHOWN)).map((a, i) => ({ ...a, primary: i === 0 })),
+      attention: s.ovAll ? ovAttention : ovAttention.slice(0, ATTENTION_SHOWN), now,
       more: !s.ovAll && ovAttention.length > ATTENTION_SHOWN ? { text: `View all ${ovAttention.length}`, go: () => this.setState({ ovAll: true }) } : null,
-      conversations: bookings.filter(b => b.in_conversation && inVilla(b.villa)).map(b => ({
-        key: b.id, initials: L.initials(b.name), title: b.name, text: `${b.takeover ? 'Ops is replying' : 'Gia is replying'} · ${L.ago(b.last_inbound_at, now)}`,
-        go: () => go('guests', { booking: b.id })
+      conversations: bookings.filter(b => b.in_conversation && inVilla(b.villa_id)).map(b => ({
+        key: b.id, initials: L.initials(b.name), title: b.name, text: `${b.villa} · ${b.takeover ? 'Ops is replying' : 'Gia is replying'} · ${L.ago(b.last_inbound_at, now)}`,
+        go: () => nav.openConversation(b.id)
       })),
-      stays: bookings.filter(b => (b.stage === 'In stay' || b.stage === 'Pre-arrival') && inVilla(b.villa)).map(b => ({
+      stays: bookings.filter(b => (b.stage === 'In stay' || b.stage === 'Pre-arrival') && inVilla(b.villa_id)).map(b => ({
         key: b.id, name: b.name, initials: L.initials(b.name), sub: `${b.villa} · ${L.dateRange(b.check_in, b.check_out)}`, stage: b.stage,
-        open: openCount(b.id), go: () => go('guests', { booking: b.id })
+        open: openCount(b.id), go: () => nav.openConversation(b.id)
       })),
-      operators: live.operators.filter(op => s.ovVilla === ALL || op.roles.some(r => r.villa === s.ovVilla))
+      operators: live.operators.filter(op => s.ovVilla === ALL || op.roles.some(r => r.villa_id === s.ovVilla))
         .slice().sort((a, b) => b.open - a.open || a.name.localeCompare(b.name)).map(op => ({
           key: op.id, name: op.name, initials: L.initials(op.name), presence: op.presence, open: op.open,
-          go: () => go('field', { fOperator: op.id, fTicket: null, fStatus: ALL })
+          go: () => nav.openOperator(op.id)
         })),
       activity: (() => {
-        const list = live.events.filter(e => s.ovVilla === ALL || !e.ticket || (ticketByRef[e.ticket] && ticketByRef[e.ticket].villa === s.ovVilla));
-        return { items: (s.ovActivity ? list.slice(0, 30) : list.slice(0, ACTIVITY_SHOWN)).map(e => this.eventView(e, now, go)),
+        const villaOf = Object.fromEntries(live.tickets.map(t => [t.ref, t.villa_id]));
+        const bookingVilla = Object.fromEntries(live.bookings.map(b => [b.id, b.villa_id]));
+        const list = live.events.filter(e => s.ovVilla === ALL || (e.ticket ? villaOf[e.ticket] : bookingVilla[e.booking_id]) === s.ovVilla);
+        return { items: (s.ovActivity ? list.slice(0, 30) : list.slice(0, ACTIVITY_SHOWN)).map(e => this.eventView(e, now, nav)),
           more: !s.ovActivity && list.length > ACTIVITY_SHOWN ? () => this.setState({ ovActivity: true }) : null };
       })(),
-      addOperator: () => go('field', { adding: true })
+      addOperator: () => nav.addOperator(null)
     };
 
-    // ---- guest journeys ----
-    const q = s.search.trim().toLowerCase();
-    const selBookingId = s.booking === DEMO || bookings.some(b => b.id === s.booking) ? s.booking : (bookings[0] ? bookings[0].id : DEMO);
-    const demoOpen = demoTickets.filter(t => t.booking === 'demo' && t.status !== 'Resolved').length;
-    const matches = (...fields) => !q || fields.join(' ').toLowerCase().includes(q);
-    const waitingFor = new Set(waitingHandoffs.map(x => x.booking_id));
-    const listRow = (key, name, villa, dates, stage, id, open, demo) => ({
-      key, name, villa, dates, stage, id, openText: openText(open), demo, on: key === selBookingId, waiting: waitingFor.has(key),
-      stBg: STAGE_COLORS[stage][0], stFg: STAGE_COLORS[stage][1], go: () => this.setState({ booking: key, gTicket: null })
-    });
-    const gjList = bookings.filter(b => matches(b.name, b.villa, b.id))
-      .map(b => listRow(b.id, b.name, b.villa, L.dateRange(b.check_in, b.check_out), b.stage, b.id, openCount(b.id), false));
-    const gjDemo = matches(demoB.name, demoB.villa, demoB.id, 'demo')
-      ? [listRow(DEMO, demoB.name, demoB.villa, demoB.dates, demoB.stage, demoB.id, demoOpen, true)] : [];
-    const gj = selBookingId === DEMO
-      ? this.demoJourney({ demoB, cS, cCur, demoTickets, scenarioNav, go })
-      : this.liveJourney({ b: bookings.find(b => b.id === selBookingId), live, tickets, now, go });
-    Object.assign(gj, { search: s.search, onSearch: e => this.setState({ search: e.target.value }), list: gjList, demoList: gjDemo, loaded, tab: s.gTab,
-      draft: s.draft, onDraft: e => this.setState({ draft: e.target.value }) });
-    gj.tabs = [['profile', 'Profile'], ['tickets', 'Tickets · ' + gj.tickets.length], ['activity', 'Activity']].map(([id, label]) => ({ id, label, on: s.gTab === id, go: () => this.setState({ gTab: id }) }));
+    const { wv, pd } = this.workflowModel({ cS, fS, cCur, fCur, nav });
 
-    // ---- operations: live tickets grouped by field operator, then unassigned, then the demo tickets ----
-    const distinct = vals => Array.from(new Set(vals)).sort();
-    const opById = Object.fromEntries(live.operators.map(o => [o.id, o]));
-    // Quick views over the ticket list; a specific status can still be picked under "More filters".
-    const VIEWS = [
-      ['active', 'Open', t => t.statusKey !== 'closed'], ['overdue', 'Overdue', t => t.overdue],
-      ['unassigned', 'Unassigned', t => !t.operator_id && t.statusKey !== 'closed'], ['closed', 'Closed', t => t.statusKey === 'closed'],
-      [ALL, 'All', () => true]
-    ];
-    const viewFn = (VIEWS.find(v => v[0] === s.fStatus) || [null, null, t => t.statusKey === s.fStatus])[2];
-    const base = tickets.filter(t =>
-      (s.fVilla === ALL || t.villa === s.fVilla) && (s.fCat === ALL || t.category === s.fCat) &&
-      (s.fOp === ALL || (s.fOp === 'none' ? !t.operator_id : String(t.operator_id) === s.fOp)));
-    const filtered = base.filter(viewFn);
-    const narrowed = s.fVilla !== ALL || s.fCat !== ALL || s.fStatus !== ALL;
-    // Open work first (newest first), then what's done (most recently resolved first).
-    const order = list => list.slice().sort((a, b) => (a.statusKey === 'closed') - (b.statusKey === 'closed') ||
-      (a.statusKey === 'closed' ? (b.resolved_at || '').localeCompare(a.resolved_at || '') : b.created_at.localeCompare(a.created_at)));
-    const groups = live.operators
-      .filter(op => s.fOp === ALL || String(op.id) === s.fOp)
-      .map(op => ({ op, tickets: order(filtered.filter(t => t.operator_id === op.id)) }))
-      .filter(g => !narrowed || g.tickets.length)
-      .sort((a, b) => b.op.open - a.op.open || a.op.name.localeCompare(b.op.name));
-    const unassigned = s.fOp === ALL || s.fOp === 'none' ? order(filtered.filter(t => !t.operator_id)) : [];
-    const demoRows = demoTickets.map(t => D.decorateTicket(t));
-    const picked = ticketByRef[s.fTicket] || demoRows.find(t => t.id === s.fTicket);
-    const urgentRef = (attention.find(a => a.kind === 'ticket' && filtered.some(t => t.ref === a.ref)) || {}).ref;
-    const firstTicket = ticketByRef[urgentRef] || unassigned[0] || (groups.find(g => g.tickets.length) || { tickets: [] }).tickets[0];
-    const selTicket = picked || (s.fOperator == null ? firstTicket || null : null);
-    // The phone follows the selected ticket's current operator (so a reassignment switches it), else the chosen operator.
-    const selOp = selTicket ? (selTicket.ref && opById[selTicket.operator_id]) || null : opById[s.fOperator] || (groups[0] ? groups[0].op : null);
-    const selOpId = selOp ? selOp.id : null;
-    const selRef = selTicket ? selTicket.ref || selTicket.id : null;
-    const opGroup = (key, title, sub, op, rows) => ({
-      key, title, sub, rows, op: op ? { presence: op.presence, open: op.open, avg: op.avg_resolve_minutes !== null ? 'avg ' + L.duration(op.avg_resolve_minutes) : '' } : null,
-      on: !!op && op.id === selOpId && !selTicket, go: op ? () => this.setState({ fOperator: op.id, fTicket: null }) : null
-    });
-    const extraFilters = [s.fVilla, s.fCat, s.fOp].filter(v => v !== ALL).length + (VIEWS.some(v => v[0] === s.fStatus) ? 0 : 1);
-    const fo = {
-      loaded, hasLive: tickets.length > 0 || live.operators.length > 0,
-      views: VIEWS.map(([key, label, fn]) => ({ key, label, count: base.filter(fn).length, on: s.fStatus === key,
-        alert: (key === 'overdue' || key === 'unassigned') && base.filter(fn).length > 0, go: () => this.setState({ fStatus: key }) })),
-      moreOpen: s.fMore || extraFilters > 0, toggleMore: () => this.setState({ fMore: !(s.fMore || extraFilters > 0) }),
-      extraCount: extraFilters,
-      filters: [
-        { key: 'fVilla', aria: 'Villa', options: [[ALL, 'All villas']].concat(live.villas.map(v => [v.name, v.name])) },
-        { key: 'fCat', aria: 'Category', options: [[ALL, 'All categories']].concat(distinct(live.tickets.map(t => t.category)).map(c => [c, L.titleCase(c)])) },
-        { key: 'fOp', aria: 'Operator', options: [[ALL, 'All operators']].concat(live.operators.map(o => [String(o.id), o.name]), [['none', 'Unassigned']]) },
-        { key: 'fStatus', aria: 'Exact status', options: [['', 'Exact status: any']].concat(live.ticket_statuses.map(st => [st, L.STATUS_LABEL[st] || L.titleCase(st)])) }
-      ].map(f => ({ ...f, value: f.options.some(o => o[0] === s[f.key]) ? s[f.key] : f.options[0][0],
-        onChange: e => this.setState({ [f.key]: f.key === 'fStatus' && !e.target.value ? 'active' : e.target.value }) })),
-      isFiltered: extraFilters > 0,
-      clear: () => this.setState({ fVilla: ALL, fCat: ALL, fOp: ALL, fStatus: 'active' }),
-      groups: (unassigned.length ? [opGroup('none', 'Unassigned', 'Needs an operator', null, unassigned.map(t => this.taskRow(t, t.ref, selRef)))] : [])
-        .concat(groups.map(g => opGroup('op' + g.op.id, g.op.name, L.roleSummary(g.op), g.op, g.tickets.map(t => this.taskRow(t, t.ref, selRef))))),
-      demoRows: demoRows.map(t => this.taskRow(t, t.id, selRef)),
-      t: !selTicket ? null : selTicket.ref ? this.liveTicketDetail(selTicket, live, go) : { ...selTicket, live: false },
-      opDetail: !selTicket && selOp ? this.operatorDetail(selOp) : null,
-      sc: scenarioNav('field'),
-      add: this.addOperatorModel(live)
+    return {
+      view: s.view, nav: nav4, sync, ctx, notice: s.notice, dismissNotice: () => this.setState({ notice: null }),
+      back: s.back && s.back !== s.view ? { label: VIEW_LABEL[s.back], go: () => { if (s.back === 'workflows') this.needFit = true; this.setState({ view: s.back, back: null }); } } : null,
+      toasts: s.eventToasts.map(e => ({ ...this.eventView(e, now, nav), dismiss: () => this.dismissEvent(e.id) })),
+      resetDemo: () => this.resetDemo(), openDemoJourney: () => this.go('demo'),
+      ov, wv, pd, live, demoOps,
+      gj: s.view === 'demo' ? this.demoJourney({ cS, cCur, demoTickets, scenarioNav }) : null,
+      properties: {
+        nav: s.pNav, query: s.pQuery,
+        setNav: patch => this.setState(st => ({ pNav: { ...st.pNav, ...patch } })),
+        setQuery: patch => this.setState(st => ({ pQuery: { ...st.pQuery, ...patch } }))
+      },
+      operations: {
+        sel: s.oSel, filters: s.oFilters,
+        setSel: ref => this.setState({ oSel: ref }),
+        setFilters: patch => this.setState(st => ({ oFilters: { ...st.oFilters, ...patch } }))
+      },
+      add: this.addOperatorModel(live),
+      opDrawer: s.opDrawer, closeDrawer: () => this.setState({ opDrawer: null })
     };
+  }
 
-    // ---- the phone: the selected operator's WhatsApp, or the demo ticket's photo-evidence walkthrough ----
-    const isScenario = !!selTicket && !selTicket.ref && selTicket.id === DEMO_FIELD_TICKET;
+  eventView(e, now, nav) {
+    const k = EVENT_KINDS[e.kind] || EVENT_KINDS.ticket;
+    const target = e.kind === 'operator' && e.operator_id ? () => nav.openOperator(e.operator_id)
+      : e.ticket ? () => nav.openTicket(e.ticket)
+      : e.booking_id ? () => nav.openConversation(e.booking_id) : () => this.go('overview');
+    return { key: e.id, time: L.when(e.at, now), label: k[0], fg: k[1], bg: k[2], urgent: e.urgent, title: e.title, text: e.text, go: target };
+  }
+
+  addOperatorModel(live) {
+    const s = this.state, f = s.opForm;
+    const villaName = id => (live.villas.find(v => v.id === id) || {}).name || id;
+    const replaced = f.villa_ids.map(v => {
+      const holder = live.operators.find(o => o.roles.some(r => r.villa_id === v && r.role === f.role));
+      return holder ? `${holder.name} at ${villaName(v)}` : null;
+    }).filter(Boolean);
+    const set = (k, v) => this.setState(st => ({ opForm: { ...st.opForm, [k]: v } }));
+    return {
+      open: s.adding, close: () => this.setState({ adding: false }),
+      form: f, set, villas: live.villas, roles: live.operator_roles.length ? live.operator_roles : Object.keys(L.ROLE_LABEL),
+      toggleVilla: id => set('villa_ids', f.villa_ids.includes(id) ? f.villa_ids.filter(x => x !== id) : f.villa_ids.concat([id])),
+      replacedText: replaced.length ? `Replaces the current ${L.ROLE_LABEL[f.role].toLowerCase()}: ${replaced.join(', ')}.` : '',
+      canSubmit: f.name.trim() && f.phone.replace(/\D/g, '').length >= 10 && f.villa_ids.length,
+      submit: () => this.addOperator(), pending: !!s.pending.addop
+    };
+  }
+
+  // The field app's photo-evidence walkthrough for the demo ticket OI-5534.
+  demoPhone(fS, fCur) {
+    const s = this.state;
     let lastEv = null;
     fS.slice(0, fCur + 1).forEach(x => { if (x.evidence) lastEv = x.evidence; });
     const slot = (key, label) => {
@@ -527,199 +478,31 @@ class OpsConsole extends React.Component {
     const rejected = lastEv && lastEv.result === 'Rejected' ? lastEv.items.filter(x => !x.ok) : [];
     const allRetaken = rejected.length > 0 && rejected.every(x => s.cap['r' + x.k]);
     const escalating = s.fBranch === 'escalate';
-    const opPhone = !isScenario && selOp ? this.operatorPhone(selOp, tickets, now) : null;
-    const ph = {
-      show: !!opPhone || isScenario, op: opPhone,
-      who: isScenario ? 'Santosh Naik · Maintenance' : opPhone ? opPhone.name : selTicket ? ownerName(selTicket.owner || '') : '',
-      hint: isScenario || opPhone ? null
-        : selTicket && !selTicket.ref ? h`Select <b>${DEMO_FIELD_TICKET}</b> to walk through the field evidence flow.`
-        : selTicket ? h`No operator on this ticket yet. Assign one and their WhatsApp chat shows here.`
-        : h`Add an operator with the button at the top right; their WhatsApp chat shows here.`,
-      idle: isScenario && fCur < D.F.ASSIGNED,
-      showTask: isScenario && fCur >= D.F.ASSIGNED,
-      assigned: isScenario && (fCur === D.F.ASSIGNED || fCur === D.F.ETA),
+    return {
+      idle: fCur < D.F.ASSIGNED,
+      showTask: fCur >= D.F.ASSIGNED,
+      assigned: fCur === D.F.ASSIGNED || fCur === D.F.ETA,
       finish: () => this.setStep('field', D.F.CLAIMED),
-      capture: isScenario && fCur === D.F.CLAIMED,
+      capture: fCur === D.F.CLAIMED,
       slots: ['c1', 'c2', 'c3', 'c4'].map(k => slot('a' + k, D.CHECKLIST[k])),
       canSubmit: allCaptured,
       submit: () => { if (allCaptured) this.runSequence('fStep', [D.F.SUBMITTED, D.F.REJECTED, D.F.REWORK]); },
-      checking: isScenario && (fCur === D.F.SUBMITTED || fCur === D.F.RESUBMITTED),
-      rework: isScenario && (fCur === D.F.REJECTED || fCur === D.F.REWORK || (escalating && fCur === D.F.VERDICT)),
+      checking: fCur === D.F.SUBMITTED || fCur === D.F.RESUBMITTED,
+      rework: fCur === D.F.REJECTED || fCur === D.F.REWORK || (escalating && fCur === D.F.VERDICT),
       reworkTitle: fCur === D.F.VERDICT ? 'Still not proven — escalating' : rejected.length + ' photos need retaking',
       reasons: rejected.map(x => ({ label: x.label, why: x.why })),
       canRetake: fCur === D.F.REWORK,
       retake: rejected.map(x => slot('r' + x.k, x.label)),
       canResubmit: allRetaken,
       resubmit: () => { if (allRetaken) this.runSequence('fStep', [D.F.RESUBMITTED, D.F.VERDICT]); },
-      accepted: isScenario && !escalating && fCur >= D.F.VERDICT,
+      accepted: !escalating && fCur >= D.F.VERDICT,
       acceptedText: fCur >= D.F.CLOSED ? 'Ticket closed. Thank you, Santosh.' : 'Closing the ticket…',
-      escalated: isScenario && escalating && fCur >= D.F.CLOSED
-    };
-
-    const { wv, pd } = this.workflowModel({ cS, fS, cCur, fCur, go });
-
-    return {
-      view: s.view, nav, sync, notice: s.notice, dismissNotice: () => this.setState({ notice: null }),
-      back: s.back && s.back !== s.view ? { label: VIEW_LABEL[s.back], go: () => { if (s.back === 'workflows') this.needFit = true; this.setState({ view: s.back, back: null }); } } : null,
-      toasts: s.eventToasts.map(e => ({ ...this.eventView(e, now, go), dismiss: () => this.dismissEvent(e.id) })),
-      resetDemo: () => this.resetDemo(), ov, gj, fo, ph, wv, pd, phoneRef: this.phoneRef
+      escalated: escalating && fCur >= D.F.CLOSED
     };
   }
 
-  eventView(e, now, go) {
-    const k = EVENT_KINDS[e.kind] || EVENT_KINDS.ticket;
-    const target = e.kind === 'operator' && e.operator_id ? () => go('field', { fOperator: e.operator_id, fTicket: null })
-      : e.ticket ? () => go('field', { fTicket: e.ticket, fOperator: null })
-      : e.booking_id ? () => go('guests', { booking: e.booking_id }) : () => go('overview');
-    return { key: e.id, time: L.when(e.at, now), label: k[0], fg: k[1], bg: k[2], urgent: e.urgent, title: e.title, text: e.text, go: target };
-  }
-
-  operatorPhone(op, tickets, now) {
-    const s = this.state;
-    return {
-      id: op.id, name: op.name, presence: op.presence, roles: L.roleSummary(op),
-      togglePresence: () => this.setPresence(op, op.presence === 'onsite' ? 'offsite' : 'onsite'),
-      presencePending: !!s.pending['presence:' + op.id],
-      tasks: tickets.filter(t => t.operator_id === op.id && t.statusKey !== 'closed').map(t => ({
-        key: t.ref, ref: t.ref, title: t.title, villa: t.villa, flag: t.timeFlag,
-        done: () => this.markDone(t), pending: !!s.pending['done:' + t.id], go: () => this.setState({ fTicket: t.ref, fOperator: null })
-      })),
-      chat: L.operatorChat(op, now),
-      draft: s.opDraft, onDraft: e => this.setState({ opDraft: e.target.value }),
-      onKey: e => { if (e.key === 'Enter') this.messageOperator(op); },
-      send: () => this.messageOperator(op), sending: !!s.pending['opmsg:' + op.id],
-      windowNote: op.window_open ? '' : `${op.name.split(' ')[0]} hasn’t written in the last 24 hours, so WhatsApp may block free text. New tasks still reach them as a template.`
-    };
-  }
-
-  operatorDetail(op) {
-    return {
-      name: op.name, presence: op.presence, roles: L.roleSummary(op), phone: op.phone ? L.phoneLabel(op.phone) : 'No number',
-      facts: [['Open tasks', String(op.open)], ['Resolved', String(op.resolved)], ['Average time to resolve', op.avg_resolve_minutes !== null ? L.duration(op.avg_resolve_minutes) : '–']],
-      togglePresence: () => this.setPresence(op, op.presence === 'onsite' ? 'offsite' : 'onsite'),
-      pending: !!this.state.pending['presence:' + op.id]
-    };
-  }
-
-  addOperatorModel(live) {
-    const s = this.state, f = s.opForm;
-    const villaName = id => (live.villas.find(v => v.id === id) || {}).name || id;
-    const replaced = f.villa_ids.map(v => {
-      const holder = live.operators.find(o => o.roles.some(r => r.villa_id === v && r.role === f.role));
-      return holder ? `${holder.name} at ${villaName(v)}` : null;
-    }).filter(Boolean);
-    const set = (k, v) => this.setState(st => ({ opForm: { ...st.opForm, [k]: v } }));
-    return {
-      open: s.adding, show: () => this.setState({ adding: true }), close: () => this.setState({ adding: false }),
-      form: f, set, villas: live.villas, roles: live.operator_roles.length ? live.operator_roles : Object.keys(L.ROLE_LABEL),
-      toggleVilla: id => set('villa_ids', f.villa_ids.includes(id) ? f.villa_ids.filter(x => x !== id) : f.villa_ids.concat([id])),
-      replacedText: replaced.length ? `Replaces the current ${L.ROLE_LABEL[f.role].toLowerCase()}: ${replaced.join(', ')}.` : '',
-      canSubmit: f.name.trim() && f.phone.replace(/\D/g, '').length >= 10 && f.villa_ids.length,
-      submit: () => this.addOperator(), pending: !!s.pending.addop
-    };
-  }
-
-  taskRow(t, ref, selRef) {
-    return {
-      key: ref, ref, demo: !t.ref, title: t.title, status: t.status, pill: t.pill, villa: t.villa, cat: t.cat,
-      sev: t.sev, sevColor: t.sevColor, sevGlyph: t.sevGlyph, ownerShort: t.ownerShort, updated: t.updated, flag: t.timeFlag || null,
-      on: ref === selRef, go: () => this.setState({ fTicket: ref, fOperator: null })
-    };
-  }
-
-  // The selected ticket, arranged around its next step: assign it if no one has it, otherwise the status change that
-  // usually comes next (the others stay one click away). Nothing here changes a ticket by itself.
-  liveTicketDetail(t, live, go) {
-    const pending = !!this.state.pending['ticket:' + t.id];
-    const closed = t.statusKey === 'closed', unassigned = !t.operator_id;
-    const NEXT = { open: 'acknowledged', acknowledged: 'in_progress', in_progress: 'closed', delayed: 'closed' };
-    const VERB = { acknowledged: 'Acknowledge', in_progress: 'Mark in progress', delayed: 'Mark delayed', closed: 'Resolve' };
-    const next = closed || unassigned ? null : NEXT[t.statusKey];
-    const op = live.operators.find(o => o.id === t.operator_id);
-    return {
-      live: true, id: t.ref, villa: t.villa, cat: t.cat, title: t.title, status: t.status, pill: t.pill,
-      sev: t.sev, sevColor: t.sevColor, sevGlyph: t.sevGlyph, flag: t.timeFlag,
-      overdue: t.overdue && !closed ? `Overdue · was due ${t.due}` : '',
-      closed, unassigned, resolvedText: t.resolvedText,
-      assign: {
-        value: t.operator_id ? String(t.operator_id) : '',
-        options: [['', unassigned ? 'Choose an operator…' : 'Unassign (back to control tower)']].concat(live.operators.map(o => [String(o.id), `${o.name} · ${o.presence}${o.open ? ` · ${o.open} open` : ''}`])),
-        onChange: e => this.assignTicket(t, e.target.value ? Number(e.target.value) : null),
-        pending: !!this.state.pending['assign:' + t.id], hasOperators: live.operators.length > 0,
-        addOperator: () => this.setState({ adding: true }),
-        current: op ? `${op.name} · ${op.presence}` : t.owner
-      },
-      primary: next ? { label: VERB[next], go: () => this.setStatusConfirmed(t, next), pending } : null,
-      secondary: closed ? [] : live.ticket_statuses.filter(st => st !== 'open' && st !== t.statusKey && st !== next)
-        .map(st => ({ key: st, label: VERB[st] || L.titleCase(st), pending, go: () => this.setStatusConfirmed(t, st) })),
-      notifyText: t.notifies_guest ? `${t.guest || 'The guest'} is updated on WhatsApp at each step.` : 'Internal ticket · the guest isn’t messaged.',
-      issue: t.details, requestLabel: t.notifies_guest ? 'Guest request' : 'Details',
-      reporter: [t.guest, t.booking_id].filter(Boolean).join(' · '),
-      details: [['Source', t.origin], ['Opened', L.whenFull(t.created_at, live.now)], ['Expected by', t.due], ['Updated', t.updated],
-        ['Assigned to', t.owner]],
-      flowItems: t.flowItems, history: t.history,
-      openJourney: t.booking_id ? () => go('guests', { booking: t.booking_id, gTab: 'tickets', gTicket: t.ref }) : null
-    };
-  }
-
-  setStatusConfirmed(t, status) {
-    // Closing a guest's request sends them a message, so check first.
-    if (status === 'closed' && t.notifies_guest && !window.confirm(`Close ${t.ref}? Gia will tell ${t.guest || 'the guest'} it’s done.`)) return;
-    this.setTicketStatus(t, status);
-  }
-
-  liveJourney({ b, live, tickets, now, go }) {
-    const s = this.state;
-    const bT = tickets.filter(t => t.booking_id === b.id);
-    const gSel = bT.find(t => t.ref === s.gTicket) || bT[0];
-    const villa = live.villas.find(v => v.id === b.villa_id) || { name: b.villa, location: b.location, caps: [] };
-    const sameDay = iso => iso.slice(0, 10) === now.slice(0, 10);
-    const staffRows = [['Caretaker', b.staff.caretaker], ['Manager', b.staff.manager]].filter(r => r[1]);
-    if (!staffRows.length && b.host) staffRows.push(['Villa host', b.host]);
-    return {
-      demo: false,
-      b: { id: b.id, name: b.name, initials: L.initials(b.name), stage: b.stage,
-        sub: `${b.villa} · ${L.dateRange(b.check_in, b.check_out)} · ${L.phoneLabel(b.phone)}` },
-      chat: L.chatItems(b, live.tickets.filter(t => t.booking_id === b.id), now, ref => this.setState({ gTab: 'tickets', gTicket: ref })),
-      sc: null,
-      takeover: b.takeover, takeoverPending: !!s.pending['takeover:' + b.id],
-      toggleTakeover: () => this.setTakeover(b, !b.takeover),
-      send: () => this.sendReply(b), sending: !!s.pending['reply:' + b.id],
-      onDraftKey: e => { if (e.key === 'Enter') this.sendReply(b); },
-      handoffs: live.handoffs.filter(x => x.booking_id === b.id && x.status === 'waiting').map(x => ({
-        id: x.id, urgent: x.urgency === 'urgent', reason: x.reason, at: L.whenFull(x.at, now),
-        pending: !!s.pending['handoff:' + x.id], resolve: () => this.resolveHandoff(x)
-      })),
-      profile: {
-        villa: { name: villa.name, loc: villa.location, code: b.villa_id },
-        rows: [
-          { k: 'Booking', v: b.id, mono: true },
-          { k: 'Stay', v: `${L.dateRange(b.check_in, b.check_out)} · ${L.nights(b.check_in, b.check_out)}` },
-          { k: 'Party', v: L.party(b) },
-          ...(b.occasion ? [{ k: 'Occasion', v: b.occasion }] : []),
-          ...(b.vip ? [{ k: 'VIP', v: 'Yes' }] : []),
-          ...L.detailRows(b.details),
-          ...(b.pre_booked_services.length ? [{ k: 'Pre-booked', v: b.pre_booked_services.join(', ') }] : []),
-          ...staffRows.map(([k, v]) => ({ k, v }))
-        ],
-        noArrival: !Object.keys(b.details || {}).length,
-        prefs: b.preferences.map(p => ({ label: p.preference, title: `${L.titleCase(p.category)} · “${p.source_quote}”`, bg: sameDay(p.at) ? '#E6EEE7' : '#F5F0E8', border: sameDay(p.at) ? '#C9D9CC' : '#EDE4DC' })),
-        journey: L.journeyRows(b, now),
-        caps: villa.caps.map(c => ({ k: c.label, glyph: c.ok ? '✓' : '✕', color: c.ok ? '#53735E' : '#C2412E', note: c.note }))
-      },
-      tickets: bT.map(t => ({ id: t.ref, cat: t.cat, title: t.title, status: t.status, pill: t.pill, flag: t.timeFlag, on: gSel && t.ref === gSel.ref, go: () => this.setState({ gTicket: t.ref }) })),
-      t: gSel ? {
-        title: gSel.title, status: gSel.status, pill: gSel.pill,
-        rows: [['Operator', gSel.owner], ['Priority', gSel.sev], [gSel.statusKey === 'closed' ? 'Resolved' : 'Expected by',
-          gSel.statusKey === 'closed' ? (gSel.resolvedText || 'Closed') : gSel.due + (gSel.overdue ? ' · overdue' : '')]]
-      } : null,
-      openField: () => gSel && go('field', { fTicket: gSel.ref, fOperator: null }),
-      activity: b.activity.map(a => ({ who: D.WHO[a.who], title: a.title, time: L.whenFull(a.at, now), text: a.text })),
-      liveNote: 'Gia is replying automatically.'
-    };
-  }
-
-  demoJourney({ demoB, cS, cCur, demoTickets, scenarioNav, go }) {
+  // The scripted concierge journey (Ananya Mehra at Villa Serena), reached from Workflows. Not live data.
+  demoJourney({ cS, cCur, demoTickets, scenarioNav }) {
     const s = this.state;
     const chat = [];
     let lastDay = null;
@@ -736,32 +519,29 @@ class OpsConsole extends React.Component {
     const bT = demoTickets.filter(t => t.booking === 'demo');
     const gSel = bT.find(t => t.id === s.gTicket) || bT[0];
     const d = gSel ? D.decorateTicket(gSel) : null;
+    const demoB = D.demoBooking(cCur);
     const sendDemo = () => { const text = s.draft.trim(); if (text) this.setState(st => ({ draft: '', demoOps: st.demoOps.concat([text]) })); };
     return {
-      demo: true,
-      b: { id: demoB.id, name: demoB.name, initials: L.initials(demoB.name), stage: demoB.stage, sub: `${demoB.villa} · ${demoB.dates} · ${demoB.phone}` },
+      b: { name: demoB.name, initials: L.initials(demoB.name), stage: demoB.stage, sub: `${demoB.villa} · ${demoB.dates} · ${demoB.phone}` },
       chat, sc: scenarioNav('concierge'),
-      takeover: s.demoTakeover, takeoverPending: false,
-      toggleTakeover: () => this.setState(st => ({ demoTakeover: !st.demoTakeover })),
-      send: sendDemo, sending: false, onDraftKey: e => { if (e.key === 'Enter') sendDemo(); },
-      handoffs: [],
+      takeover: s.demoTakeover, toggleTakeover: () => this.setState(st => ({ demoTakeover: !st.demoTakeover })),
+      draft: s.draft, onDraft: draft => this.setState({ draft }), send: sendDemo,
+      tab: s.gTab,
+      tabs: [['profile', 'Profile'], ['tickets', 'Tickets · ' + bT.length], ['activity', 'Activity']].map(([id, label]) => ({ id, label, on: s.gTab === id, go: () => this.setState({ gTab: id }) })),
       profile: {
-        villa: { name: D.DEMO_VILLA.name, loc: D.DEMO_VILLA.loc, code: D.DEMO_VILLA.code },
+        villa: { name: D.DEMO_VILLA.name, loc: D.DEMO_VILLA.loc },
         rows: [{ k: 'Booking', v: demoB.id, mono: true }, { k: 'Stay', v: demoB.dates }, { k: 'Party', v: demoB.party }, { k: 'Arrival', v: demoB.arrival }],
-        noArrival: false,
         prefs: prefs.map(x => ({ label: x.p, bg: x.fresh ? '#E6EEE7' : '#F5F0E8', border: x.fresh ? '#C9D9CC' : '#EDE4DC' })),
-        journey: [],
         caps: D.capRows(D.DEMO_VILLA.caps)
       },
       tickets: bT.map(t => ({ id: t.id, cat: t.cat, title: t.title, status: t.status, pill: D.statusPill(t.status), on: gSel && t.id === gSel.id, go: () => this.setState({ gTicket: t.id }) })),
       t: d ? { title: d.title, status: d.status, pill: d.pill, rows: [['Operator', d.owner], ['Priority', d.sev]] } : null,
-      openField: () => gSel && go('field', { fTicket: gSel.id, fOperator: null }),
-      activity: cS.slice(0, cCur + 1).map(x => ({ who: D.WHO[x.who], title: x.title, time: x.d + ', ' + x.t, text: x.event || x.decision || (x.msgs ? x.msgs[x.msgs.length - 1][1] : '') })).reverse(),
-      liveNote: 'Demo scenario · replies here aren’t sent.'
+      openField: () => gSel && this.go('operations', () => ({ oSel: gSel.id })),
+      activity: cS.slice(0, cCur + 1).map(x => ({ who: D.WHO[x.who], title: x.title, time: x.d + ', ' + x.t, text: x.event || x.decision || (x.msgs ? x.msgs[x.msgs.length - 1][1] : '') })).reverse()
     };
   }
 
-  workflowModel({ cS, fS, cCur, fCur, go }) {
+  workflowModel({ cS, fS, cCur, fCur, nav }) {
     const s = this.state;
     const wf = s.wf, g = D.GRAPHS[wf], steps = wf === 'concierge' ? cS : fS, cur = wf === 'concierge' ? cCur : fCur, P = s.pos[wf];
     const onPath = new Set(steps.map(x => x.node));
@@ -841,7 +621,7 @@ class OpsConsole extends React.Component {
         })
       } : null,
       openLabel: wf === 'concierge' ? 'View guest journey' : 'View in Operations',
-      open: () => wf === 'concierge' ? go('guests', { booking: DEMO, gTicket: tBase.id }) : go('field', { fTicket: tBase.id })
+      open: () => wf === 'concierge' ? this.go('demo', () => ({ gTab: 'tickets', gTicket: tBase.id })) : this.go('operations', () => ({ oSel: tBase.id }))
     };
     const wv = {
       heading: wf === 'concierge' ? 'Continuous guest concierge' : 'AI-verified maintenance',
@@ -873,14 +653,16 @@ class OpsConsole extends React.Component {
   render() {
     const vm = this.viewModel();
     return h`<div className="shell">
+      <a className="skip-link" href="#main">Skip to content</a>
       ${Sidebar(vm)}
       ${Topbar(vm)}
-      <main className="main">
+      <main className=${'main view-' + vm.view + (vm.back ? ' has-back' : '')} id="main" tabIndex="-1">
         ${vm.back && h`<button className="back-link" onClick=${vm.back.go}>← Back to ${vm.back.label}</button>`}
         ${vm.view === 'overview' && Overview(vm.ov, vm.sync)}
-        ${vm.view === 'guests' && GuestJourneys(vm.gj, vm.sync, this.chatRef)}
-        ${vm.view === 'field' && FieldOperations(vm.fo, vm.ph, vm.sync, vm.phoneRef)}
+        <${PropertiesWorkspace} active=${vm.view === 'properties'} ctx=${vm.ctx} ...${vm.properties} />
+        <${OperationsWorkspace} active=${vm.view === 'operations'} ctx=${vm.ctx} live=${vm.live} demo=${vm.demoOps} ...${vm.operations} />
         ${vm.view === 'workflows' && Workflows(vm.wv, vm.pd, this.canvasRef)}
+        ${vm.view === 'demo' && DemoJourney(vm.gj, this.chatRef)}
       </main>
       ${vm.toasts.length > 0 && h`<div className="event-toasts" aria-live="polite">
         ${vm.toasts.map(t => h`<div key=${t.key} className=${'event-toast' + (t.urgent ? ' urgent' : '')}>
@@ -891,7 +673,8 @@ class OpsConsole extends React.Component {
           <button className="x" onClick=${t.dismiss} aria-label="Dismiss">×</button>
         </div>`)}
       </div>`}
-      ${vm.fo.add.open && AddOperator(vm.fo.add)}
+      ${vm.opDrawer && h`<${OperatorDrawer} key=${vm.opDrawer} id=${vm.opDrawer} ctx=${vm.ctx} onClose=${vm.closeDrawer} />`}
+      ${vm.add.open && AddOperator(vm.add)}
       ${vm.notice && h`<div className=${'toast ' + vm.notice.tone} role=${vm.notice.tone === 'error' ? 'alert' : 'status'}>
         <span>${vm.notice.text}</span><button onClick=${vm.dismissNotice} aria-label="Dismiss">×</button>
       </div>`}
@@ -900,14 +683,6 @@ class OpsConsole extends React.Component {
 }
 
 // ---------- shell ----------
-
-function LiveTag({ sync }) {
-  if (sync.error) return h`<span className="live-tag error" title=${sync.error}>Can’t reach the backend · retrying</span>`;
-  if (!sync.loaded) return h`<span className="live-tag">Connecting…</span>`;
-  return h`<span className="live-tag ok"><i></i>Live · synced ${sync.at} IST</span>`;
-}
-const DemoChip = () => h`<span className="demo-chip">Demo</span>`;
-const Pill = (p, status) => h`<span className="pill" style=${{ background: p.bg, color: p.fg }}>${p.icon} ${status}</span>`;
 
 function Sidebar(vm) {
   return h`<aside className="sidebar">
@@ -918,15 +693,16 @@ function Sidebar(vm) {
         <div className="brand-sub">Lohono Guest Ops</div>
       </div>
     </div>
-    <nav className="side-nav">
+    <nav className="side-nav" aria-label="Main">
       ${vm.nav.map(n => h`<button key=${n.id} className=${n.on ? 'on' : ''} onClick=${n.go} aria-current=${n.on ? 'page' : undefined}>
         <span className=${'nav-mark' + (n.diamond ? ' diamond' : '')}></span>
         <span className="nav-label">${n.label}</span>
-        ${n.badge > 0 && h`<span className="nav-badge">${n.badge}</span>`}
+        ${n.badge > 0 && h`<span className="nav-badge" title=${`${n.badge} ${n.badgeLabel}`}><span className="sr-only">, </span>${n.badge}<span className="sr-only"> ${n.badgeLabel}</span></span>`}
       </button>`)}
     </nav>
     <div className="demo-box">
       <p>Items tagged <${DemoChip} /> and Workflows are scripted scenarios.</p>
+      <button className="btn-link" onClick=${vm.openDemoJourney}>Demo guest journey</button>
       <button className="btn-link" onClick=${vm.resetDemo}>Reset demo scenarios</button>
     </div>
   </aside>`;
@@ -935,8 +711,9 @@ function Sidebar(vm) {
 function Topbar(vm) {
   return h`<div className="topbar">
     <div className="brand-name">Gia</div>
-    ${vm.nav.map(n => h`<button key=${n.id} className=${'nav-btn' + (n.on ? ' on' : '')} onClick=${n.go}>${n.label}${n.badge > 0 ? ` · ${n.badge}` : ''}</button>`)}
-    <button className="btn" onClick=${vm.resetDemo}>Reset demo</button>
+    <nav className="topnav" aria-label="Main">
+      ${vm.nav.map(n => h`<button key=${n.id} className=${'nav-btn' + (n.on ? ' on' : '')} onClick=${n.go} aria-current=${n.on ? 'page' : undefined}>${n.label}${n.badge > 0 ? ` · ${n.badge}` : ''}</button>`)}
+    </nav>
   </div>`;
 }
 
@@ -950,7 +727,7 @@ function Overview(ov, sync) {
         <h1 className="page-title">Overview</h1>
       </div>
       <div className="head-actions">
-        <select className="select-sm" value=${ov.villa.value} onChange=${ov.villa.onChange} aria-label="Villa">
+        <select className="select-sm" value=${ov.villa.value} onChange=${ov.villa.onChange} aria-label="Property">
           ${ov.villa.options.map(([v, label]) => h`<option key=${v} value=${v}>${label}</option>`)}
         </select>
         <${LiveTag} sync=${sync} />
@@ -968,16 +745,7 @@ function Overview(ov, sync) {
         <section className="card section">
           <h2 className="h2">Needs attention</h2>
           ${ov.attention.length === 0 && h`<div className="all-clear">${ov.loaded ? h`<b>All clear.</b> Nothing needs a person right now.` : 'Loading…'}</div>`}
-          <ul className="attn-list">
-            ${ov.attention.map(a => h`<li key=${a.key} className=${'attn-item' + (a.primary ? ' first' : '')}>
-              <div className="attn-text">
-                <span className="chip-row"><span className=${'state-chip ' + a.tone}>${a.state}</span>${a.pill && Pill(a.pill, a.status)}</span>
-                <span className="attn-title">${a.title}</span>
-                <span className="note">${a.who}${a.who ? ' · ' : ''}<span className="mono">${a.ref}</span></span>
-              </div>
-              <button className=${a.primary ? 'btn-primary' : 'btn'} onClick=${a.go}>${a.action}</button>
-            </li>`)}
-          </ul>
+          <${AttentionList} items=${ov.attention} now=${ov.now} onAct=${a => a.go()} highlightFirst=${true} showVilla=${true} />
           ${ov.more && h`<button className="btn-link" onClick=${ov.more.go}>${ov.more.text}</button>`}
         </section>
 
@@ -1002,7 +770,7 @@ function Overview(ov, sync) {
           </button>`)}
         </section>`}
         <section className="card section">
-          <h2 className="h3">Stays</h2>
+          <h2 className="h3">Guests in stay and arriving</h2>
           ${ov.stays.map(b => h`<button key=${b.key} className="list-btn mini-row" onClick=${b.go}>
             <span className="avatar">${b.initials}</span>
             <span className="mini-body"><b>${b.name}</b><span className="note">${b.sub} · ${b.stage}</span></span>
@@ -1024,22 +792,7 @@ function Overview(ov, sync) {
   </div>`;
 }
 
-const PresenceChip = ({ presence }) => h`<span className=${'presence ' + presence}>${presence === 'onsite' ? 'Onsite' : 'Offsite'}</span>`;
-
-// ---------- guest journeys ----------
-
-function ChatItem(m, i, arr) {
-  // Only label the sender on the first bubble of a consecutive run from them, like any chat UI.
-  const sameSenderAsPrev = arr && arr[i - 1] && arr[i - 1].kind === m.kind;
-  switch (m.kind) {
-    case 'date': return h`<div key=${i} className="chat-date">${m.text}</div>`;
-    case 'guest': return h`<div key=${i} className="bubble guest">${m.text}<div className="time">${m.time}</div></div>`;
-    case 'gia': return h`<div key=${i} className="bubble gia">${!sameSenderAsPrev && h`<div className="who">Gia · AI concierge</div>`}${m.text}<div className="time">${m.time}</div></div>`;
-    case 'ops': return h`<div key=${i} className="bubble ops">${!sameSenderAsPrev && h`<div className="who">Ops team · human</div>`}${m.text}${m.time && h`<div className="time">${m.time}</div>`}</div>`;
-    case 'note': return h`<div key=${i} className="chat-note">${m.text}${m.time && h` · ${m.time}`}</div>`;
-    default: return h`<button key=${i} className="chat-chip" onClick=${m.go}><span className="sq"></span>${m.text}<span className="time">${m.time}</span></button>`;
-  }
-}
+// ---------- the scripted demo guest journey ----------
 
 function ScenarioBar(sc) {
   return h`<div className="scenario-bar">
@@ -1052,479 +805,63 @@ function ScenarioBar(sc) {
   </div>`;
 }
 
-function BookingRow(b) {
-  return h`<button key=${b.key} className=${'list-btn booking-row' + (b.on ? ' on' : '')} onClick=${b.go} aria-current=${b.on ? 'true' : undefined}>
-    <span className="top">
-      <span className="name">${b.name}${b.demo && h` <${DemoChip} />`}</span>
-      <span className="chip-tag" style=${{ background: b.stBg, color: b.stFg }}>${b.stage}</span>
-    </span>
-    <span className="note">${b.villa} · ${b.dates}${b.openText !== 'No open tickets' ? ' · ' + b.openText : ''}</span>
-    ${b.waiting && h`<span className="state-chip red">Needs a person</span>`}
-  </button>`;
-}
-
-function GuestJourneys(gj, sync, chatRef) {
-  const t = gj.t, p = gj.profile, waiting = gj.handoffs.length > 0;
-  return h`<div className="page" data-screen-label="Guest Journeys">
+function DemoJourney(gj, chatRef) {
+  const t = gj.t, p = gj.profile;
+  return h`<div className="page" data-screen-label="Demo guest journey">
     <header className="page-head compact">
-      <h1 className="page-title">Guest journeys</h1>
-      <${LiveTag} sync=${sync} />
+      <div><div className="kicker">Scripted scenario · not live data</div><h1 className="page-title">Demo guest journey</h1></div>
     </header>
     <div className="columns">
-      <div className="card col col-list">
-        <div className="search">
-          <input value=${gj.search} onChange=${gj.onSearch} placeholder="Search guest, villa or booking" aria-label="Search guest, villa or booking" />
-        </div>
-        <div className="scroll">
-          ${gj.list.map(BookingRow)}
-          ${gj.list.length === 0 && h`<div className="empty list-empty">${!gj.loaded ? 'Loading…' : gj.search ? 'No bookings match.' : 'No bookings yet.'}</div>`}
-          ${gj.demoList.length > 0 && h`<div className="list-divider">Demo scenario</div>`}
-          ${gj.demoList.map(BookingRow)}
-        </div>
-      </div>
-
       <div className="card col col-chat">
         <div className="chat-head">
           <span className="avatar">${gj.b.initials}</span>
           <div className="chat-head-body">
-            <div className="chat-head-name">${gj.b.name}${gj.demo && h` <${DemoChip} />`} <span className="stage-tag">${gj.b.stage}</span></div>
+            <div className="chat-head-name">${gj.b.name} <${DemoChip} /> <span className="stage-tag">${gj.b.stage}</span></div>
             <div className="chat-head-sub">${gj.b.sub}</div>
           </div>
-          <button className=${gj.takeover ? 'btn' : waiting ? 'btn-primary' : 'btn'} onClick=${gj.toggleTakeover} disabled=${gj.takeoverPending}>
-            ${gj.takeover ? 'Hand back to Gia' : 'Take over'}
-          </button>
+          <button className="btn" onClick=${gj.toggleTakeover}>${gj.takeover ? 'Hand back to Gia' : 'Take over'}</button>
         </div>
-        ${gj.sc && ScenarioBar(gj.sc)}
-        ${gj.handoffs.map(ho => h`<div key=${ho.id} className=${'handoff-bar' + (ho.urgent ? ' urgent' : '')} role="status">
-          <span className="tx"><b>${ho.urgent ? 'Urgent · needs a person' : 'Needs a person'}</b> · ${ho.reason} <span className="at">${ho.at}</span></span>
-          <button className="btn small" onClick=${ho.resolve} disabled=${ho.pending}>Mark resolved</button>
-        </div>`)}
+        ${ScenarioBar(gj.sc)}
         ${gj.takeover && h`<div className="takeover-banner">You’re replying · Gia is paused for this guest.</div>`}
-        <div ref=${chatRef} className="chat-log">
-          ${gj.chat.map(ChatItem)}
-          ${gj.chat.length === 0 && h`<div className="chat-date">No messages yet</div>`}
-        </div>
+        <div ref=${chatRef} className="chat-log">${gj.chat.map(ChatItem)}</div>
         <div className="composer">
           ${gj.takeover
-            ? h`<${Frag}><input value=${gj.draft} onChange=${gj.onDraft} onKeyDown=${gj.onDraftKey} disabled=${gj.sending} placeholder=${gj.demo ? 'Reply (demo, not sent)…' : 'Reply on WhatsApp…'} aria-label="Reply to the guest" />
-                <button className="send" onClick=${gj.send} disabled=${gj.sending}>${gj.sending ? 'Sending…' : 'Send'}</button><//>`
-            : h`<${Frag}><span className="live"></span>
-                <span className="status">${gj.liveNote}</span><//>`}
+            ? h`<${Composer} value=${gj.draft} onChange=${gj.onDraft} onSend=${gj.send} placeholder="Reply (demo, not sent)…" label="Reply to the guest" />`
+            : h`<div className="composer-status"><span className="live"></span>Demo scenario · replies here aren’t sent.</div>`}
         </div>
       </div>
-
       <div className="card col col-context">
         <div className="tabs" role="tablist">
           ${gj.tabs.map(tb => h`<button key=${tb.id} role="tab" aria-selected=${tb.on} className=${tb.on ? 'on' : ''} onClick=${tb.go}>${tb.label}</button>`)}
         </div>
         <div className="tab-body">
           ${gj.tab === 'profile' && h`<${Frag}>
-            <div>
-              <div className="villa-name">${p.villa.name}</div>
-              <div className="villa-loc">${p.villa.loc}</div>
+            <div><div className="villa-name">${p.villa.name}</div><div className="villa-loc">${p.villa.loc}</div></div>
+            <dl className="kv">${p.rows.map(r => h`<${Frag} key=${r.k}><dt>${r.k}</dt><dd className=${r.mono ? 'mono' : ''}>${r.v}</dd><//>`)}</dl>
+            <div className="stack"><div className="eyebrow">Preferences</div>
+              <div className="prefs">${p.prefs.map((x, i) => h`<span key=${i} className="pref" style=${{ background: x.bg, border: '1px solid ' + x.border }}>${x.label}</span>`)}</div>
             </div>
-            <dl className="kv">
-              ${p.rows.map(r => h`<${Frag} key=${r.k}><dt className="k">${r.k}</dt><dd className=${r.mono ? 'mono' : ''}>${r.v}</dd><//>`)}
-              ${p.noArrival && h`<${Frag}><dt className="k">Arrival</dt><dd>Not shared yet</dd><//>`}
-            </dl>
-            <div className="stack">
-              <div className="eyebrow">Preferences</div>
-              <div className="prefs">
-                ${p.prefs.map((x, i) => h`<span key=${i} className="pref" title=${x.title} style=${{ background: x.bg, border: '1px solid ' + x.border }}>${x.label}</span>`)}
-              </div>
-              ${p.prefs.length === 0 && h`<span className="note">None yet.</span>`}
-            </div>
-            ${p.journey.length > 0 && h`<div className="stack sm">
-              <div className="eyebrow">Pre-arrival messages</div>
-              ${p.journey.map(j => h`<div key=${j.k} className="mark-row">
-                <span className="g" style=${{ color: j.color }}>${j.glyph}</span><span className="spacer">${j.k}</span><span className="n">${j.note}</span>
-              </div>`)}
-            </div>`}
-            <details className="more">
-              <summary>Villa capabilities</summary>
-              <div className="more-body">
-                ${p.caps.map(c => h`<div key=${c.k} className="mark-row">
-                  <span className="g" style=${{ color: c.color }}>${c.glyph}</span><span className="spacer">${c.k}</span><span className="n">${c.note}</span>
-                </div>`)}
-              </div>
-            </details><//>`}
-
+            <details className="more"><summary>Villa capabilities</summary><div className="more-body">
+              ${p.caps.map(c => h`<div key=${c.k} className="mark-row"><span className="g" style=${{ color: c.color }}>${c.glyph}</span><span className="spacer">${c.k}</span><span className="n">${c.note}</span></div>`)}
+            </div></details><//>`}
           ${gj.tab === 'tickets' && h`<${Frag}>
             <div className="stack">
               ${gj.tickets.map(tk => h`<button key=${tk.id} className=${'list-btn ticket-card' + (tk.on ? ' on' : '')} onClick=${tk.go}>
                 <span className="top"><span className="title">${tk.title}</span>${Pill(tk.pill, tk.status)}</span>
-                <span className="id">${tk.id} · ${tk.cat}${tk.flag ? ' · ' + tk.flag.text : ''}</span>
+                <span className="id">${tk.id} · ${tk.cat}</span>
               </button>`)}
-              ${gj.tickets.length === 0 && h`<div className="note">No tickets for this guest.</div>`}
+              ${gj.tickets.length === 0 && h`<div className="note">No tickets yet in this scenario.</div>`}
             </div>
             ${t && h`<div className="ticket-detail">
-              <dl className="kv">
-                ${t.rows.map(([k, v]) => h`<${Frag} key=${k}><dt className="k">${k}</dt><dd>${v}</dd><//>`)}
-              </dl>
+              <dl className="kv">${t.rows.map(([k, v]) => h`<${Frag} key=${k}><dt>${k}</dt><dd>${v}</dd><//>`)}</dl>
               <button className="btn" onClick=${gj.openField}>Open in Operations</button>
             </div>`}<//>`}
-
-          ${gj.tab === 'activity' && h`<${Frag}>
-            ${gj.activity.map((a, i) => h`<div key=${i} className="activity-row">
-              <span className="who" style=${{ background: a.who.bg, color: a.who.fg }}>${a.who.label}</span>
-              <div className="body">
-                <div className="top"><span className="ti">${a.title}</span><span className="t">${a.time}</span></div>
-                <div className="tx">${a.text}</div>
-              </div>
-            </div>`)}
-            ${gj.activity.length === 0 && h`<div className="note">Nothing yet.</div>`}<//>`}
+          ${gj.tab === 'activity' && gj.activity.map((a, i) => h`<div key=${i} className="activity-row">
+            <span className="who" style=${{ background: a.who.bg, color: a.who.fg }}>${a.who.label}</span>
+            <div className="body"><div className="top"><span className="ti">${a.title}</span><span className="t">${a.time}</span></div><div className="tx">${a.text}</div></div>
+          </div>`)}
         </div>
       </div>
-    </div>
-  </div>`;
-}
-
-function HistoryRow(x, i) {
-  return h`<div key=${i} className="hist-row">
-    <span className="t">${x.time}</span>
-    <div><div className="ti">${x.title}</div><div className="tx">${x.text}</div></div>
-  </div>`;
-}
-
-// ---------- operations ----------
-
-function TaskRow(r) {
-  return h`<button key=${r.key} className=${'list-btn task-row' + (r.on ? ' on' : '')} onClick=${r.go} aria-current=${r.on ? 'true' : undefined}>
-    <span className="top"><span className="title">${r.title}</span>${Pill(r.pill, r.status)}</span>
-    <span className="meta">
-      <span className="mono">${r.ref}</span>${r.demo && h` <${DemoChip} />`}<span>${r.villa}</span>
-      <span className="sev" style=${{ color: r.sevColor }}>${r.sevGlyph} ${r.sev}</span>
-      ${r.flag ? h`<span className="time-flag" title=${r.flag.title} style=${{ color: r.flag.color, background: r.flag.bg }}>${r.flag.text}</span>` : h`<span>${r.ownerShort}</span>`}
-    </span>
-  </button>`;
-}
-
-function OpGroup(g) {
-  return h`<${Frag} key=${g.key}>
-    ${g.go
-      ? h`<button className=${'list-btn group-head' + (g.on ? ' on' : '')} onClick=${g.go}>
-          <span className="name">${g.title} <${PresenceChip} presence=${g.op.presence} /></span>
-          <span className="note">${g.sub}</span>
-          <span className="stats">${g.op.open} open${g.op.avg ? ' · ' + g.op.avg : ''}</span>
-        </button>`
-      : h`<div className="group-head plain"><span className="name">${g.title}</span><span className="note">${g.sub}</span></div>`}
-    ${g.rows.map(TaskRow)}
-    ${g.rows.length === 0 && h`<div className="group-empty">No tasks.</div>`}
-  <//>`;
-}
-
-function HistoryDetails(t, extra) {
-  return h`<details className="more">
-    <summary>History & details</summary>
-    <div className="more-body">
-      ${t.details && h`<dl className="facts">${t.details.map(([k, v]) => h`<div key=${k}><dt>${k}</dt><dd>${v}</dd></div>`)}</dl>`}
-      ${t.flowItems && h`<div className="flow-bars">
-        ${t.flowItems.map(f => h`<div key=${f.label}><div className="bar" style=${{ background: f.bg }}></div><span style=${{ color: f.fg }}>${f.label}</span></div>`)}
-      </div>`}
-      ${extra}
-      <div className="audit">
-        <div className="eyebrow">Audit trail</div>
-        ${t.history.map((x, i) => HistoryRow(x, i))}
-        ${t.history.length === 0 && h`<div className="note">No entries yet.</div>`}
-      </div>
-    </div>
-  </details>`;
-}
-
-function LiveTicketDetail(t) {
-  const a = t.assign;
-  return h`<${Frag}>
-    <div className="ticket-head">
-      <div className="ref">${t.id} · ${t.villa} · ${t.cat}</div>
-      <h2 className="title">${t.title}</h2>
-      <div className="chips">
-        ${Pill(t.pill, t.status)}
-        <span className="sev-chip" style=${{ color: t.sevColor }}>${t.sevGlyph} ${t.sev}</span>
-        ${t.flag && h`<span className="time-flag" title=${t.flag.title} style=${{ color: t.flag.color, background: t.flag.bg }}>${t.flag.text}</span>`}
-      </div>
-    </div>
-    ${t.overdue && h`<div className="alert-bar" role="status">${t.overdue}</div>`}
-
-    <section className="next-action" aria-label="Next step">
-      ${t.closed ? h`<div className="resolved-line">${t.resolvedText || 'Closed'}</div>`
-        : t.unassigned ? h`<${Frag}>
-            <label className="next-label" htmlFor="assign-select">Assign operator</label>
-            ${a.hasOperators
-              ? h`<select id="assign-select" className="select-primary" value=${a.value} onChange=${a.onChange} disabled=${a.pending}>
-                  ${a.options.map(([v, label]) => h`<option key=${v} value=${v}>${label}</option>`)}
-                </select>`
-              : h`<button className="btn-primary" onClick=${a.addOperator}>Add an operator</button>`}
-          <//>`
-        : h`<button className="btn-primary" onClick=${t.primary.go} disabled=${t.primary.pending}>${t.primary.label}</button>`}
-      ${t.secondary.length > 0 && h`<div className="secondary-actions">
-        ${t.secondary.map(x => h`<button key=${x.key} className="btn small" onClick=${x.go} disabled=${x.pending}>${x.label}</button>`)}
-      </div>`}
-      ${!t.closed && h`<p className="note">${t.notifyText}</p>`}
-    </section>
-
-    <section className="request">
-      <div className="eyebrow">${t.requestLabel}</div>
-      <p>${t.issue}</p>
-      <div className="note">${t.reporter}${t.openJourney && h` · <button className="btn-link" onClick=${t.openJourney}>View guest journey</button>`}</div>
-    </section>
-
-    ${!t.unassigned && h`<div className="assignee-row">
-      <label className="k" htmlFor="op-select">Operator</label>
-      <select id="op-select" value=${a.value} onChange=${a.onChange} disabled=${a.pending}>
-        ${a.options.map(([v, label]) => h`<option key=${v} value=${v}>${label}</option>`)}
-      </select>
-    </div>`}
-
-    ${HistoryDetails(t, h`<p className="note">Closes when the operator replies DONE on WhatsApp or taps Mark done, or when ops resolves it. Photo-verified closure is shown on the demo ticket ${DEMO_FIELD_TICKET}.</p>`)}
-  <//>`;
-}
-
-function DemoTicketDetail(t, fo) {
-  return h`<${Frag}>
-    <div className="ticket-head">
-      <div className="ref">${t.id} · ${t.villa} · ${t.cat} · <${DemoChip} /></div>
-      <h2 className="title">${t.title}</h2>
-      <div className="chips">${Pill(t.pill, t.status)}<span className="sev-chip" style=${{ color: t.sevColor }}>${t.sevGlyph} ${t.sev}</span></div>
-    </div>
-    <div className="facts">
-      <div><div className="k">Owner</div><div className="v">${t.owner}</div></div>
-      <div><div className="k">Severity</div><div className="v" style=${{ fontWeight: 700, color: t.sevColor }}>${t.sevGlyph} ${t.sev}</div></div>
-      <div><div className="k">Source</div><div className="v">${t.origin}</div></div>
-      <div><div className="k">Updated</div><div className="v">${t.updated}</div></div>
-    </div>
-    ${t.humanReason && h`<div className="human-only"><b>Human only</b><span>${t.humanReason}</span></div>`}
-
-    ${t.tracker && h`<div className="tracker">
-      ${t.tracker.map(k => h`<div key=${k.label} style=${{ border: '1px solid ' + k.border, background: k.bg }}>
-        <span className="g" style=${{ color: k.fg }}>${k.glyph}</span><span className="l" style=${{ color: k.fg }}>${k.label}</span>
-      </div>`)}
-    </div>`}
-
-    <div className="report">
-      <div className="eyebrow">Original report</div>
-      <p>“${t.issue}”</p>
-    </div>
-
-    <div className="two-col">
-      <div>
-        <div className="eyebrow">Work checklist</div>
-        ${t.checklist.map(c => h`<div key=${c.label} className="check-row">
-          <span className="g" style=${{ color: c.color }}>${c.glyph}</span><span className="l">${c.label}</span><span className="s" style=${{ color: c.color }}>${c.stateLabel}</span>
-        </div>`)}
-      </div>
-      <div>
-        <div className="eyebrow">Closure conditions</div>
-        ${t.closure.map(c => h`<div key=${c.label} className="check-row" style=${{ alignItems: 'normal' }}>
-          <span className="g" style=${{ color: c.color }}>${c.glyph}</span><span>${c.label}</span>
-        </div>`)}
-      </div>
-    </div>
-
-    <div className="review" style=${{ border: '1px solid ' + t.review.border, background: t.review.bg }}>
-      <div className="top">
-        <span className="title" style=${{ color: t.review.fg }}>${t.review.title}</span>
-        ${t.review.simulated && h`<span className="sim-tag">Simulated vision check</span>`}
-      </div>
-      <p>${t.review.text}</p>
-    </div>
-
-    ${t.attempts.map(at => h`<div key=${at.n} className="attempt">
-      <div className="top">
-        <span className="ti">Evidence · attempt ${at.n} <span>· ${at.time}</span></span>
-        <span className="result" style=${{ background: at.bg, color: at.fg }}>${at.result}</span>
-      </div>
-      <div className="photos">
-        ${at.items.map(it => h`<div key=${it.label} className="photo" style=${{ border: '1px solid ' + it.border }}>
-          <div className="hatch">
-            ${it.ph}
-            <span className="badge" style=${{ background: it.badgeBg }}>${it.glyph}</span>
-          </div>
-          <div className="cap">
-            <b>${it.label}</b>
-            ${it.hasWhy && h`<span className="why">${it.why}</span>`}
-          </div>
-        </div>`)}
-      </div>
-    </div>`)}
-
-    ${HistoryDetails({ history: t.history })}
-    ${t.scenario && h`<div className="task-scenario">
-      <span className="step-text">Step ${fo.sc.no} of ${fo.sc.total} · <b>${fo.sc.title}</b></span>
-      <span className="spacer"></span>
-      <button className="btn-sq" onClick=${fo.sc.prev} aria-label="Previous step">◀</button>
-      <button className="btn-step primary" onClick=${fo.sc.next}>Next ▶</button>
-      <button className="btn-step outline" onClick=${fo.sc.flow}>View workflow</button>
-    </div>`}
-  <//>`;
-}
-
-function FieldOperations(fo, ph, sync, phoneRef) {
-  const d = fo.opDetail;
-  return h`<div className="page" data-screen-label="Operations">
-    <header className="page-head compact">
-      <h1 className="page-title">Operations</h1>
-      <div className="head-actions">
-        <${LiveTag} sync=${sync} />
-        <button className="btn small" onClick=${fo.add.show}>+ Add operator</button>
-      </div>
-    </header>
-    <div className="toolbar">
-      <div className="view-tabs" role="group" aria-label="Ticket view">
-        ${fo.views.map(v => h`<button key=${v.key} className=${(v.on ? 'on' : '') + (v.alert ? ' alert' : '')} onClick=${v.go} aria-pressed=${v.on}>
-          ${v.label} <span className="n">${v.count}</span>
-        </button>`)}
-      </div>
-      <button className="btn-link" onClick=${fo.toggleMore} aria-expanded=${fo.moreOpen}>More filters${fo.extraCount ? ` (${fo.extraCount})` : ''}</button>
-    </div>
-    ${fo.moreOpen && h`<div className="filters">
-      ${fo.filters.map(f => h`<select key=${f.key} value=${f.value} onChange=${f.onChange} aria-label=${f.aria}>
-        ${f.options.map(([v, label]) => h`<option key=${v} value=${v}>${label}</option>`)}
-      </select>`)}
-      ${fo.isFiltered && h`<button className="btn-link" onClick=${fo.clear}>Clear</button>`}
-    </div>`}
-
-    <div className=${'columns field-cols' + (ph.show ? '' : ' no-phone')}>
-      <div className="card task-list">
-        ${fo.groups.map(OpGroup)}
-        ${fo.groups.length === 0 && h`<div className="empty">${!fo.loaded ? 'Loading…' : fo.hasLive ? 'No tickets in this view.' : h`No tickets or operators yet. <button className="btn-link" onClick=${fo.add.show}>Add operator</button>`}</div>`}
-        ${fo.demoRows.length > 0 && h`<div className="list-divider">Demo scenarios</div>`}
-        ${fo.demoRows.map(TaskRow)}
-      </div>
-
-      <div className="card task-detail">
-        ${fo.t ? (fo.t.live ? LiveTicketDetail(fo.t) : DemoTicketDetail(fo.t, fo))
-          : d ? h`<${Frag}>
-              <div className="ticket-head">
-                <div className="ref">Operator · ${d.phone}</div>
-                <h2 className="title">${d.name}</h2>
-                <div className="chips"><${PresenceChip} presence=${d.presence} /></div>
-              </div>
-              <p className="note">${d.roles}</p>
-              <dl className="facts">${d.facts.map(([k, v]) => h`<div key=${k}><dt>${k}</dt><dd>${v}</dd></div>`)}</dl>
-              <div className="next-action">
-                <button className="btn" onClick=${d.togglePresence} disabled=${d.pending}>Mark ${d.presence === 'onsite' ? 'offsite' : 'onsite'}</button>
-                <p className="note">New tasks go to onsite operators first. Operators can also reply ONSITE or OFFSITE.</p>
-              </div>
-            <//>`
-          : h`<div className="empty">Select a ticket.</div>`}
-      </div>
-
-      ${ph.show && Phone(ph, phoneRef)}
-    </div>
-  </div>`;
-}
-
-function AddOperator(a) {
-  const f = a.form;
-  return h`<div className="modal-backdrop" onClick=${e => { if (e.target === e.currentTarget) a.close(); }}>
-    <form className="modal card" onSubmit=${e => { e.preventDefault(); if (a.canSubmit) a.submit(); }}>
-      <div className="modal-head"><h2 className="h2">Add operator</h2><button type="button" className="x" onClick=${a.close} aria-label="Close">×</button></div>
-      <label>Name<input value=${f.name} onChange=${e => a.set('name', e.target.value)} placeholder="Ramesh Patil" autoFocus /></label>
-      <label>WhatsApp number<input value=${f.phone} onChange=${e => a.set('phone', e.target.value)} placeholder="91 98XXX XXXXX (with country code)" inputMode="tel" /></label>
-      <label>Role<select value=${f.role} onChange=${e => a.set('role', e.target.value)}>
-        ${a.roles.map(r => h`<option key=${r} value=${r}>${L.ROLE_LABEL[r] || r}</option>`)}
-      </select></label>
-      <fieldset><legend>Villas</legend>
-        ${a.villas.map(v => h`<label key=${v.id} className="check"><input type="checkbox" checked=${f.villa_ids.includes(v.id)} onChange=${() => a.toggleVilla(v.id)} />${v.name}</label>`)}
-      </fieldset>
-      <fieldset><legend>Right now</legend>
-        ${['onsite', 'offsite'].map(p => h`<label key=${p} className="check"><input type="radio" name="presence" checked=${f.presence === p} onChange=${() => a.set('presence', p)} />${p === 'onsite' ? 'Onsite' : 'Offsite'}</label>`)}
-      </fieldset>
-      ${a.replacedText && h`<p className="warn-text">${a.replacedText}</p>`}
-      <p className="note">Tickets for these villas go to them by role (maintenance, housekeeping, then caretaker or manager), onsite first. Gia sends each task on WhatsApp; they reply DONE when it’s finished.</p>
-      <div className="modal-actions">
-        <button type="button" className="btn" onClick=${a.close}>Cancel</button>
-        <button type="submit" className="btn-primary" disabled=${!a.canSubmit || a.pending}>${a.pending ? 'Adding…' : 'Add operator'}</button>
-      </div>
-    </form>
-  </div>`;
-}
-
-function Slot(sl, prefix) {
-  return h`<button key=${sl.key} className="slot" onClick=${sl.tap} style=${{ border: sl.border }} aria-pressed=${sl.on}>
-    <span className="thumb" style=${{ background: sl.thumb }}>${sl.icon}</span>
-    <span className="l">${prefix || ''}${sl.label}</span>
-  </button>`;
-}
-
-function OperatorPhone(op, phoneRef) {
-  return h`<${Frag}>
-    <div className="phone-head">
-      <span className="app">Lohono Field · WhatsApp</span>
-      <span className="who-row"><span className="who">${op.name}</span>
-        <button className=${'presence ' + op.presence} onClick=${op.togglePresence} disabled=${op.presencePending} title="Switch onsite / offsite">${op.presence === 'onsite' ? 'Onsite' : 'Offsite'}</button>
-      </span>
-    </div>
-    <div className="phone-body" ref=${phoneRef} data-who=${op.id}>
-      ${op.tasks.length > 0 && h`<div className="phone-label">Open tasks</div>`}
-      ${op.tasks.map(t => h`<div key=${t.key} className="phone-task">
-        <button className="list-btn" onClick=${t.go} style=${{ flexDirection: 'column', gap: '3px' }}>
-          <span className="ref">${t.ref} · ${t.villa}</span>
-          <span className="ti">${t.title}</span>
-        </button>
-        <span className="task-foot">
-          ${t.flag && h`<span className="time-flag" title=${t.flag.title} style=${{ color: t.flag.color, background: t.flag.bg }}>${t.flag.text}</span>`}
-          <button className="done-btn" onClick=${t.done} disabled=${t.pending}>${t.pending ? 'Saving…' : 'Mark done'}</button>
-        </span>
-      </div>`)}
-      ${op.tasks.length === 0 && h`<div className="phone-label muted">No open tasks</div>`}
-      ${op.chat.map((m, i) => m.kind === 'date' ? h`<div key=${i} className="chat-date">${m.text}</div>`
-        : m.kind === 'note' ? h`<div key=${i} className="chat-note">${m.text} · ${m.time}</div>`
-        : h`<div key=${i} className=${'pbubble ' + (m.kind === 'in' ? 'mine' : m.kind === 'ops' ? 'ops' : 'gia')}>
-            ${m.kind !== 'in' && h`<div className="who">${m.kind === 'ops' ? 'Ops team' : 'Gia'}</div>`}${m.text}<div className="time">${m.time}</div>
-          </div>`)}
-      ${op.chat.length === 0 && h`<div className="phone-hint">No messages yet. Tasks Gia sends ${op.name.split(' ')[0]} appear here.</div>`}
-    </div>
-    ${op.windowNote && h`<div className="phone-warn">${op.windowNote}</div>`}
-    <div className="phone-compose">
-      <input value=${op.draft} onChange=${op.onDraft} onKeyDown=${op.onKey} disabled=${op.sending} placeholder=${`Message ${op.name.split(' ')[0]}…`} aria-label=${`Message ${op.name} on WhatsApp`} />
-      <button onClick=${op.send} disabled=${op.sending} aria-label="Send">➤</button>
-    </div>
-  <//>`;
-}
-
-function Phone(ph, phoneRef) {
-  return h`<div className="phone-col">
-    <div className="eyebrow">${ph.op ? 'Operator chat · WhatsApp' : 'Field app preview'}</div>
-    <div className="phone">
-      ${ph.op ? OperatorPhone(ph.op, phoneRef) : h`<${Frag}>
-      <div className="phone-head">
-        <span className="app">Lohono Field</span>
-        <span className="who">${ph.who}</span>
-      </div>
-      <div className="phone-body">
-        ${ph.hint && h`<div className="phone-hint">${ph.hint}</div>`}
-        ${ph.idle && h`<div className="phone-hint">No task assigned yet. The ops agent is creating the ticket.</div>`}
-        ${ph.showTask && h`<div className="phone-task">
-          <span className="ref">OI-5534 · Medium</span>
-          <span className="ti">Basin leak · Bedroom 2 bathroom</span>
-          <span className="loc">Casa Alba · Awas Shores, Alibaug</span>
-        </div>`}
-        ${ph.assigned && h`<${Frag}>
-          <div className="phone-text">Guest has been told you’ll arrive by 10:30 am. You’ll need a photo for each checklist item before the ticket can close.</div>
-          <button className="phone-cta" onClick=${ph.finish}>I’ve finished the repair</button><//>`}
-        ${ph.capture && h`<${Frag}>
-          <div className="phone-label">Add a photo for each item</div>
-          ${ph.slots.map(sl => Slot(sl))}
-          <button className="phone-cta" onClick=${ph.submit} disabled=${!ph.canSubmit} style=${{ background: ph.canSubmit ? '#C2412E' : '#D9CCC1' }}>Submit evidence</button><//>`}
-        ${ph.checking && h`<div className="phone-state checking">
-          <span className="icon">◎</span><span className="ti">Checking your photos…</span><span className="tx">Each photo is compared against its checklist item.</span>
-        </div>`}
-        ${ph.rework && h`<${Frag}>
-          <div className="phone-state rework">
-            <span className="ti">${ph.reworkTitle}</span>
-            ${ph.reasons.map(rs => h`<span key=${rs.label} className="tx"><b>${rs.label}:</b> ${rs.why}</span>`)}
-          </div>
-          ${ph.canRetake && h`<${Frag}>
-            ${ph.retake.map(sl => Slot(sl, 'Retake · '))}
-            <button className="phone-cta" onClick=${ph.resubmit} disabled=${!ph.canResubmit} style=${{ background: ph.canResubmit ? '#C2412E' : '#D9CCC1' }}>Resubmit evidence</button><//>`}<//>`}
-        ${ph.accepted && h`<div className="phone-state accepted">
-          <span className="icon">✓</span><span className="ti">Evidence accepted</span><span className="tx">${ph.acceptedText}</span>
-        </div>`}
-        ${ph.escalated && h`<div className="phone-state escalated">
-          <span className="ti">Escalated to villa manager</span><span className="tx">Francis D’Souza will inspect on site. Please stay at the villa until he arrives.</span>
-        </div>`}
-      </div><//>`}
     </div>
   </div>`;
 }

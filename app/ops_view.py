@@ -1,97 +1,48 @@
-"""Live data for the ops console (/): one snapshot of bookings, conversations, tickets, handoffs, field operators
-and the activity that matters, shaped for the console's screens. Read-only; the console's actions are routes in
-main.py."""
+"""Live data for the ops console (/), shaped for its screens. Read-only; the console's actions are routes in
+main.py.
+
+snapshot() is what the console polls: a portfolio-wide summary (bookings, tickets, handoffs, operators, what needs
+attention and the activity that matters), deliberately without any conversation or chat history so it stays small
+however many villas there are. A booking's conversation, a ticket's history and an operator's WhatsApp thread are
+loaded on their own when someone opens them."""
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 
-from . import operators, scheduler, store
+from . import operators, portfolio, scheduler, store
 
 MESSAGES_PER_BOOKING = 150
 MESSAGES_PER_OPERATOR = 100
 EVENTS_LENGTH = 30
 IN_CONVERSATION = timedelta(minutes=15)  # a guest who wrote this recently is "in conversation"
+SERVICE_WINDOW = timedelta(hours=24)     # WhatsApp allows free text only this long after the guest's last message
+EXCERPT_LENGTH = 3                       # guest messages shown with a ticket: what they wrote just before it
+EXCERPT_WINDOW = timedelta(minutes=30)   # was raised (the last message alone if none falls in this window)
+# Audit actions that read as notes inside a guest's chat.
+CHAT_NOTES = {"ops_takeover": "Ops took over this chat · Gia paused", "ops_handback": "Handed back to Gia"}
 
 
 def snapshot(ticket_statuses: list[str]) -> dict:
-    now = store.now()
-    today = now.date()
-    villas = {v["villa_id"]: v for v in store.all_villas()}
-    bookings = store.all_bookings()
-    names = {b["booking_id"]: b["guest_name"] for b in bookings}
+    base = portfolio.load()
+    now, today, villas, names = base["now"], base["today"], base["villas"], base["names"]
     taken_over = store.takeover_phones()
-    all_steps = store.all_steps()
-
-    staff = {p["id"]: p for p in store.all_staff()}
-    tickets = [_ticket(t, villas, names, staff, now) for t in store.all_tickets()]
+    last_in = store.last_inbound_by_booking()
+    tickets = base["tickets"]
     by_ref = {t["ref"]: t for t in tickets}
-    ticket_history: dict[str, list] = {t["ref"]: [] for t in tickets}
 
-    out_bookings = []
-    for b in bookings:
-        rec = store.booking_record(b["booking_id"])
-        for entry in rec["audit"]:
-            ref = _data(entry).get("ticket")
-            if ref in ticket_history:
-                ticket_history[ref].append(_activity(entry, names))
+    bookings = []
+    for b in base["bookings"]:
         villa = villas.get(b["villa_id"], {})
-        contacts = store.staff_for_villa(b["villa_id"])
-        steps = all_steps.get(b["booking_id"], {})
-        last_in = max((m["at"] for m in rec["messages"] if m["direction"] == "in"), default=None)
-        out_bookings.append({
-            "id": b["booking_id"],
-            "name": b["guest_name"],
-            "phone": b["guest_phone"],
-            "language": b.get("language"),
-            "villa_id": b["villa_id"],
-            "villa": villa.get("name", b["villa_id"]),
-            "location": villa.get("location", ""),
-            "check_in": b["check_in"],
-            "check_out": b["check_out"],
-            "status": b["status"],
-            "stage": _stage(b, today),
-            "adults": b.get("adults"), "children": b.get("children"), "pets": b.get("pets"),
-            "occasion": b.get("occasion"), "vip": bool(b.get("vip")),
-            "pre_booked_services": b.get("pre_booked_services") or [],
-            "details": store.guest_details(b["booking_id"]),
-            "preferences": [{k: p[k] for k in ("category", "preference", "source_quote", "at")}
-                            for p in rec["preferences"]],
-            "messages": [{k: m[k] for k in ("direction", "body", "at")}
-                         for m in rec["messages"][-MESSAGES_PER_BOOKING:]],
-            "journey": [{"step": scheduler.STEP_LABELS[name], **{k: steps[name][k] for k in
-                         ("status", "due_at", "sent_at", "delivered_at", "read_at", "channel", "note")}}
-                        for name in scheduler.STEPS if name in steps],
+        inbound = last_in.get(b["booking_id"])
+        bookings.append({
+            "id": b["booking_id"], "name": b["guest_name"], "villa_id": b["villa_id"],
+            "villa": villa.get("name", b["villa_id"]), "location": villa.get("location", ""),
+            "check_in": b["check_in"], "check_out": b["check_out"],
+            "status": b["status"], "status_label": portfolio.booking_label(b),
+            "state": portfolio.booking_state(b), "stage": portfolio.stage(b, today),
             "takeover": b["guest_phone"] in taken_over,
-            "last_inbound_at": last_in,
-            "in_conversation": bool(last_in and now - datetime.fromisoformat(last_in) < IN_CONVERSATION),
-            "staff": {role: p["name"] for role, p in contacts.items()},
-            "host": (villa.get("host") or {}).get("name"),
-            "activity": [_activity(e, names) for e in rec["audit"]],
-        })
-    for t in tickets:
-        t["history"] = list(reversed(ticket_history[t["ref"]]))  # oldest first, like a ticket's own log
-
-    handoffs = [{
-        "id": h["id"], "booking_id": h["booking_id"], "guest": names.get(h["booking_id"], h["phone"]),
-        "villa": villas.get(_villa_of(h["booking_id"], bookings), {}).get("name", ""),
-        "reason": h["reason"], "urgency": h["urgency"], "status": h["status"], "at": h["at"],
-    } for h in store.all_handoffs()]
-
-    roles = store.operator_roles()
-    ops = []
-    for p in staff.values():
-        mine = [t for t in tickets if t["operator_id"] == p["id"]]
-        resolved = [t["resolve_minutes"] for t in mine if t["resolve_minutes"] is not None]
-        ops.append({
-            "id": p["id"], "name": p["name"], "phone": p["phone"], "presence": p.get("presence") or "onsite",
-            "roles": [{"villa_id": r["villa_id"], "villa": villas.get(r["villa_id"], {}).get("name", r["villa_id"]),
-                       "role": r["role"]} for r in roles.get(p["id"], [])],
-            "open": sum(t["status"] != "closed" for t in mine),
-            "resolved": len(resolved),
-            "avg_resolve_minutes": round(sum(resolved) / len(resolved)) if resolved else None,
-            "window_open": operators.window_open(p["id"]),
-            "messages": [{k: m[k] for k in ("direction", "body", "at", "ticket_ref")}
-                         for m in store.operator_messages(p["id"], MESSAGES_PER_OPERATOR)],
+            "last_inbound_at": inbound,
+            "in_conversation": bool(inbound and now - datetime.fromisoformat(inbound) < IN_CONVERSATION),
         })
 
     events = []
@@ -102,67 +53,124 @@ def snapshot(ticket_statuses: list[str]) -> dict:
 
     return {
         "now": now.isoformat(),
+        "bookings_updated_at": store.bookings_updated_at(),
         "ticket_statuses": ticket_statuses,
-        "villas": [{"id": v["villa_id"], "name": v["name"], "location": v.get("location", ""),
-                    "caps": _capabilities(v)} for v in villas.values()],
-        "bookings": out_bookings,
+        "villas": [{"id": v["villa_id"], "name": v["name"], "location": v.get("location", "")} for v in villas.values()],
+        "bookings": bookings,
         "tickets": tickets,
-        "handoffs": handoffs,
-        "operators": ops,
+        "handoffs": base["handoffs"],
+        "operators": _operators(base),
         "operator_roles": list(store.OPERATOR_ROLES),
+        "attention": portfolio.attention(base),
         "events": events[:EVENTS_LENGTH],
     }
 
 
-def _stage(b: dict, today: date) -> str:
-    if b["status"] == "cancelled":
-        return "Cancelled"
-    check_in, check_out = date.fromisoformat(b["check_in"]), date.fromisoformat(b["check_out"])
-    if b["status"] == "in_stay" or (b["status"] == "confirmed" and check_in <= today < check_out):
-        return "In stay"
-    if today < check_in:
-        return "Pre-arrival"
-    return "Post-stay"
+def _operators(base: dict) -> list[dict]:
+    roles = store.operator_roles()
+    mine: dict[int, list[dict]] = {}
+    for t in base["tickets"]:
+        mine.setdefault(t["operator_id"], []).append(t)
+    return [_operator_summary(p, mine.get(p["id"], []), roles.get(p["id"], []), base["villas"])
+            for p in base["staff"].values()]
 
 
-def _ticket(t: dict, villas: dict, names: dict, staff: dict, now: datetime) -> dict:
-    due = datetime.fromisoformat(t["due_at"]) if t["due_at"] else None
-    resolved_at = t["resolved_at"] or (t["updated_at"] if t["status"] == "closed" else None)  # closed before tracking
-    minutes = operators.minutes_to_resolve({**t, "resolved_at": resolved_at})
-    op = staff.get(t["operator_id"])
+def _operator_summary(p: dict, mine: list[dict], roles: list[dict], villas: dict) -> dict:
+    """An operator as the console lists them: villas and roles, open and resolved work, and the 24-hour window."""
+    resolved = [t["resolve_minutes"] for t in mine if t["resolve_minutes"] is not None]
     return {
-        "id": t["id"], "ref": t["ref"], "booking_id": t["booking_id"], "guest": names.get(t["booking_id"], ""),
-        "villa_id": t["villa_id"], "villa": villas.get(t["villa_id"], {}).get("name", t["villa_id"]),
-        "category": t["category"], "severity": t["severity"], "summary": t["summary"], "details": t["details"],
-        "status": t["status"], "assignee": t["assignee"] or "Unassigned", "source": t["source"] or "guest",
-        "notifies_guest": t["source"] in (None, "guest"),
-        "created_at": t["created_at"], "due_at": t["due_at"], "updated_at": t["updated_at"],
-        "overdue": bool(due and t["status"] != "closed" and now > due),
-        "operator_id": op["id"] if op else None,
-        "operator": op["name"] if op else None,
-        "resolved_at": resolved_at, "resolved_by": t["resolved_by"],
-        "resolve_minutes": minutes,
-        "within_sla": bool(resolved_at and due and datetime.fromisoformat(resolved_at) <= due) if resolved_at else None,
+        "id": p["id"], "name": p["name"], "phone": p["phone"], "presence": p.get("presence") or "onsite",
+        "roles": [{"villa_id": r["villa_id"], "villa": villas.get(r["villa_id"], {}).get("name", r["villa_id"]),
+                   "role": r["role"]} for r in roles],
+        "open": sum(t["status"] != "closed" for t in mine),
+        "resolved": len(resolved),
+        "avg_resolve_minutes": round(sum(resolved) / len(resolved)) if resolved else None,
+        "window_open": operators.window_open(p["id"]),
     }
 
 
-def _villa_of(booking_id: str | None, bookings: list[dict]) -> str | None:
-    return next((b["villa_id"] for b in bookings if b["booking_id"] == booking_id), None)
+# ---------------- loaded when someone opens them ----------------
+
+def conversation(booking_id: str) -> dict | None:
+    """One booking's WhatsApp conversation with Gia and everything ops needs beside it: who's handling it, the
+    pre-arrival messages, waiting handoffs, the guest's details and preferences, and their requests."""
+    b = store.get_booking(booking_id)
+    if not b:
+        return None
+    now = store.now()
+    today = now.date()
+    villa = store.get_villa(b["villa_id"]) or {}
+    names = {booking_id: b["guest_name"]}
+    messages, total = store.messages_for_booking(booking_id, MESSAGES_PER_BOOKING)
+    rec = store.booking_record(booking_id)
+    steps = store.steps_for_booking(booking_id)
+    inbound = store.last_inbound_at(b["guest_phone"])
+    staff = {p["id"]: p for p in store.all_staff()}
+    tickets = [portfolio.ticket_view(t, {b["villa_id"]: villa}, names, staff, now) for t in rec["tickets"]]
+    return {
+        "booking": {**portfolio.booking_summary(b, today, villa), "phone": b["guest_phone"],
+                    "language": b.get("language"), "villa_id": b["villa_id"], "villa": villa.get("name", b["villa_id"]),
+                    "pre_booked_services": b.get("pre_booked_services") or []},
+        "messages": [{k: m.get(k) for k in ("id", "direction", "body", "at", "status", "error")} for m in messages],
+        "total_messages": total,
+        "takeover": store.takeover_active(b["guest_phone"]),
+        "last_inbound_at": inbound,
+        "window_open": bool(inbound and now - datetime.fromisoformat(inbound) < SERVICE_WINDOW),
+        "journey": [{"step": scheduler.STEP_LABELS[name], **{k: steps[name][k] for k in
+                     ("status", "due_at", "sent_at", "delivered_at", "read_at", "channel", "note")}}
+                    for name in scheduler.STEPS if name in steps],
+        "handoffs": [{k: h[k] for k in ("id", "reason", "urgency", "status", "at")} for h in rec["handoffs"]],
+        "details": store.guest_details(booking_id),
+        "preferences": [{k: p[k] for k in ("category", "preference", "source_quote", "at")} for p in rec["preferences"]],
+        "tickets": tickets,
+        # Takeovers and ticket changes, shown as notes and chips in the chat (oldest first).
+        "events": [_activity(e, names) for e in reversed(rec["audit"])
+                   if e["action"] in CHAT_NOTES or e["action"] in ("handoff_raised", "ticket_escalated")
+                   or e["action"].startswith("ticket_status:")],
+    }
 
 
-def _capabilities(v: dict) -> list[dict]:
-    """What the villa can and can't do, from its capability record: the console's read-only list."""
-    caps = []
-    pool = v.get("pool") or {}
-    if pool:
-        caps.append({"label": "Pool", "ok": bool(pool.get("available")), "note": pool.get("type", "")})
-    for key, s in (v.get("services") or {}).items():
-        note = s.get("price", "") if s.get("available") else s.get("alternative", "Not available")
-        caps.append({"label": key.replace("_", " ").capitalize(), "ok": bool(s.get("available")), "note": note})
-    pets = v.get("pets") or {}
-    if pets:
-        caps.append({"label": "Pets", "ok": bool(pets.get("allowed")), "note": "" if pets.get("allowed") else "Not allowed"})
-    return caps
+def ticket(ticket_id: int) -> dict | None:
+    """One ticket with its history and the guest's words that led to it."""
+    t = store.get_ticket(ticket_id)
+    if not t:
+        return None
+    now = store.now()
+    b = store.get_booking(t["booking_id"]) or {}
+    villa = store.get_villa(t["villa_id"]) or {}
+    names = {t["booking_id"]: b.get("guest_name", "")}
+    staff = {p["id"]: p for p in store.all_staff()}
+    view = portfolio.ticket_view(t, {t["villa_id"]: villa}, names, staff, now)
+    history = [_activity(e, names) for e in reversed(store.audit_for_bookings([t["booking_id"]], 500))
+               if _data(e).get("ticket") == t["ref"]]
+    messages, _ = store.messages_for_booking(t["booking_id"], 200)
+    before = [m for m in messages if m["direction"] == "in" and m["at"] <= t["created_at"]]
+    since = (datetime.fromisoformat(t["created_at"]) - EXCERPT_WINDOW).isoformat()
+    asked = [m for m in before if m["at"] >= since][-EXCERPT_LENGTH:] or before[-1:]
+    return {
+        **view, "history": history,
+        "excerpt": [{k: m[k] for k in ("body", "at")} for m in asked] if view["notifies_guest"] else [],
+        "booking": portfolio.booking_summary(b, now.date(), villa) if b else None,
+        "villa_location": villa.get("location", ""),
+    }
+
+
+def operator(staff_id: int) -> dict | None:
+    """A field operator's WhatsApp thread and open tasks (the Team tab and the ticket's "Message operator")."""
+    p = store.get_staff(staff_id)
+    if not p:
+        return None
+    now = store.now()
+    villas = {v["villa_id"]: v for v in store.all_villas()}
+    rows = store.tickets_for_operator(staff_id)
+    names = {b: (store.get_booking(b) or {}).get("guest_name", "") for b in {t["booking_id"] for t in rows}}
+    mine = [portfolio.ticket_view(t, villas, names, {staff_id: p}, now) for t in rows]
+    return {
+        **_operator_summary(p, mine, store.operator_roles().get(staff_id, []), villas),
+        "messages": [{k: m[k] for k in ("direction", "body", "at", "ticket_ref")}
+                     for m in store.operator_messages(staff_id, MESSAGES_PER_OPERATOR)],
+        "tasks": [t for t in mine if t["status"] != "closed"],
+    }
 
 
 def _data(entry: dict) -> dict:
@@ -170,6 +178,9 @@ def _data(entry: dict) -> dict:
         return json.loads(entry["data"] or "{}")
     except (TypeError, ValueError):
         return {}
+
+
+STATUS_WORDS = {"closed": "resolved", "in_progress": "in progress"}
 
 
 def _activity(entry: dict, names: dict) -> dict:
@@ -189,8 +200,15 @@ def _activity(entry: dict, names: dict) -> dict:
         title = f"{d.get('ticket')} created"
         text = f"{d.get('category', '').replace('_', ' ').capitalize()} · {d.get('severity', '')} · for {guest}"
     elif action.startswith("ticket_status:"):
-        status = action.split(":", 1)[1].replace("_", " ")
-        who, title, text = "human", f"{d.get('ticket')} → {status}", f"Ops updated the ticket for {guest}"
+        status = STATUS_WORDS.get(action.split(":", 1)[1], action.split(":", 1)[1].replace("_", " "))
+        who, title = "human", f"{d.get('ticket')} → {status}"
+        text = f"By {d.get('by') or 'ops'}" + (f" · “{d['note']}”" if d.get("note") else "")
+    elif action == "ticket_escalated":
+        who, title, text = "human", f"{d.get('ticket')} escalated", d.get("reason", "")
+    elif action == "ticket_deescalated":
+        who, title, text = "human", f"{d.get('ticket')} no longer escalated", f"By {d.get('by') or 'ops'}"
+    elif action == "message_failed":
+        title, text = "Message not delivered", f"WhatsApp didn’t take a message to {guest}: {d.get('error', '')}"
     elif action == "save_arrival_details":
         fields = ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in d.items() if v not in (None, "", []))
         who, title, text = "ai", "Arrival details saved", fields
@@ -236,7 +254,7 @@ def _activity(entry: dict, names: dict) -> dict:
         text = ", ".join(d.get("villas") or [])
 
     return {"at": entry["at"], "booking_id": entry["booking_id"], "action": action, "who": who, "title": title,
-            "text": text, "tier": entry["tier"]}
+            "text": text, "tier": entry["tier"], "ticket": d.get("ticket")}
 
 
 # Toast-worthy events pop up on screen as they happen; the rest only appear in the Live activity list.
@@ -271,6 +289,12 @@ def _event(entry: dict, names: dict, by_ref: dict, villas: dict) -> dict | None:
     if action == "ticket_status:delayed" and t:
         return {**ev, "kind": "delayed", "toast": True, "title": f"{t['ref']} is running late",
                 "text": f"{t['summary']} · {villa}"}
+    if action == "ticket_escalated" and t:
+        return {**ev, "kind": "flag", "toast": True, "urgent": True, "title": f"{t['ref']} escalated",
+                "text": f"{t['summary']} · {villa} · {d.get('reason', '')}"}
+    if action == "message_failed":
+        return {**ev, "kind": "flag", "toast": True, "title": f"Message to {guest} not delivered",
+                "text": d.get("error", "")}
     if action == "t1_no_reply_flagged":
         return {**ev, "kind": "flag", "toast": True, "title": f"No reply from {guest} before arrival",
                 "text": f"{d.get('ticket')} raised for {d.get('assigned_to', 'the villa team')}"}

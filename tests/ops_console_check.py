@@ -80,19 +80,24 @@ async def main_async():
 
     s = c.get("/api/state", auth=auth).json()
     b = next(x for x in s["bookings"] if x["id"] == "LH-24009")
-    check(b["villa"] == "Casa Alba" and b["stage"] in ("In stay", "Pre-arrival", "Post-stay"),
-          f"booking stage and villa ({b['stage']}, {b['villa']})")
-    check(b["messages"][-1]["body"] == "Hi Gia" and b["preferences"][0]["preference"] == "Loves seafood",
-          "booking carries its transcript and preferences")
+    # LH-24009's sample status is "Pre-Arrival", which isn't an OI status: never counted as a confirmed stay
+    check(b["villa"] == "Casa Alba" and b["stage"] == "Unconfirmed" and "not recognised" in b["status_label"],
+          f"booking stage and villa ({b['stage']}, {b['villa']}, {b['status_label']})")
+    check("messages" not in b and "activity" not in b, "the polled snapshot carries no chat history")
+    convo = c.get("/api/bookings/LH-24009/conversation", auth=auth).json()
+    check(convo["messages"][-1]["body"] == "Hi Gia" and convo["preferences"][0]["preference"] == "Loves seafood",
+          "conversation endpoint carries the transcript and preferences")
     st = next(x for x in s["tickets"] if x["ref"] == t["ref"])
-    check(st["notifies_guest"] and not st["overdue"] and st["history"][0]["title"] == f"{t['ref']} created",
+    hist = c.get(f"/api/tickets/{t['id']}", auth=auth).json()["history"]
+    check(st["notifies_guest"] and not st["overdue"] and hist[0]["title"] == f"{t['ref']} created",
           "ticket has guest flag, SLA state and history")
     check(any(h["id"] == ho and h["status"] == "waiting" for h in s["handoffs"]), "handoff listed as waiting")
     check(s["ticket_statuses"] == ["open", *main.STATUS_MESSAGES], "allowed statuses come from the backend")
     check(any(e["title"] == f"{t['ref']} raised for Abhaya Trivedi" and e["toast"] for e in s["events"]),
           "events: ticket raised, as a toast")
     check(any(e["kind"] == "handoff" and e["toast"] for e in s["events"]), "events: guest asking for a person")
-    check(any(cap["label"] == "Private chef" for cap in next(v for v in s["villas"] if v["id"] == "ALB-AWS-02")["caps"]),
+    check(any(sv["label"] == "Private chef" for sv in
+              c.get("/api/properties/ALB-AWS-02", auth=auth).json()["facilities"]["services"]),
           "villa capabilities listed")
 
     # status change on a guest's request: guest messaged, audit written
@@ -185,7 +190,7 @@ def incoming(phone, text):
 
 
 def operator_chat(c, auth, staff_id):
-    return next(o for o in c.get("/api/state", auth=auth).json()["operators"] if o["id"] == staff_id)
+    return c.get(f"/api/operators/{staff_id}", auth=auth).json()
 
 
 async def operator_checks(c, auth):
