@@ -463,7 +463,8 @@ async def villas_page(request: Request, q: str = "", area: str = "", residency: 
         return _e(f"{'on' if s['enabled'] else 'OFF'} · T-{s['t7_days']} / T-{s['t1_days']} · "
                   f"{s['window_start']}–{s['window_end']} · reminder "
                   f"{str(s['reminder_hours']) + 'h' if s['reminder_enabled'] else 'off'} · no-reply flag "
-                  f"{'on' if s['flag_no_reply'] else 'off'}")
+                  f"{'on' if s['flag_no_reply'] else 'off'} · missing-IDs flag "
+                  f"{'on' if s['flag_missing_ids'] else 'off'}")
 
     rows = ""
     for v in shown:
@@ -504,6 +505,7 @@ async def villas_page(request: Request, q: str = "", area: str = "", residency: 
         f"<label>Reminder {on_off('reminder_enabled')} after "
         f"<input type=number name=reminder_hours min=1 max=72 placeholder={d['reminder_hours']}> h without a reply</label>"
         f"<label>Flag no reply by T-1 to the caretaker, manager and control tower {on_off('flag_no_reply')}</label>"
+        f"<label>Flag missing ID documents at T-1 to the villa host (UC-OPS-02) {on_off('flag_missing_ids')}</label>"
         "<br><button formaction=/admin/villas/uc-ops-01>Apply to selected</button>"
         "</fieldset></form>"
         "<h2>Staff</h2><p class=muted>Caretakers and managers get the ticket email in copy and a WhatsApp alert "
