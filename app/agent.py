@@ -29,7 +29,7 @@ What you can do
    - Everything else: check get_villa_info first. Only if the villa can deliver it, call create_ticket, then tell the guest the ticket reference, the price if chargeable, and the expected time.
    - If the villa cannot offer it, say so kindly and offer the nearest alternative listed in the villa data. Never promise anything the villa data does not allow (BR-02).
    - Requests for a service still need confirmation from the provider: say "I've requested it and will confirm shortly", not "it's booked".
-3. Collect arrival details before check-in (UC-OPS-02): arrival time, transport needs, guest names, dietary needs, allergies, occasions, children and pet details. Ask naturally, one or two things at a time, never as a form. Save what you learn with save_arrival_details.
+3. Collect arrival details before check-in (UC-OPS-02), starting at T-7: guest names, ID document status for every adult (for a foreign national, note that Form C registration will be completed from their passport at check-in), arrival time, transport needs, dietary needs, allergies, occasions, and children or pet details. Ask naturally, one or two things at a time, never as a form. Save each detail as you learn it with save_arrival_details, not all at once. "Guest context" below shows what's already captured; don't re-ask for it.
 4. Log preferences (UC-OPS-09): whenever the guest reveals a lasting preference (food, room setup, activities, occasions, routines), call log_preference with the guest's own words as the source quote. Do this silently; don't announce it.
 5. Hand off to a person (UC-OPS-10) with handoff_to_human when: the guest asks for a person; the guest is clearly upset or the same issue failed twice; anything involving safety, a medical issue, police, a fire, a gas leak, an injury or a missing person (urgency "urgent"). For safety or medical issues, tell the guest a named person is taking over right away and give the on-ground contact's phone number from the villa data; for medical emergencies also tell them to call 112.
 6. Report status: use get_my_tickets when the guest asks about an earlier request.
@@ -83,7 +83,7 @@ TOOL_SPECS = [
                 "occasion": {"type": "string"},
                 "children": {"type": "string", "description": "Ages and needs, e.g. baby cot."},
                 "pets": {"type": "string"},
-                "id_documents": {"type": "string", "description": "Status only, e.g. 'will share at check-in'. Never ask for ID numbers in chat."},
+                "id_documents": {"type": "string", "description": "Status only, e.g. 'will share at check-in' or 'foreign national, passport to be collected for Form C'. Never ask for ID numbers in chat."},
             },
             "additionalProperties": False,
         },
@@ -146,6 +146,7 @@ def _booking_context(booking: dict | None) -> str:
         "occasion": booking.get("occasion"),
         "vip": booking.get("vip"),
         "pre_booked_services": booking.get("pre_booked_services", []),
+        "arrival_details_captured_so_far": store.guest_details(booking["booking_id"]) or "none yet",
     }, ensure_ascii=False, indent=1)
 
 

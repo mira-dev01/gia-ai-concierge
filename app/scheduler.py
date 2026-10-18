@@ -28,6 +28,7 @@ DEFAULTS = {
     "reminder_enabled": True,
     "reminder_hours": 24,
     "flag_no_reply": True,
+    "flag_missing_ids": True,
 }
 STEPS = ("welcome", "t7", "t7_reminder", "t1")
 STEP_LABELS = {"welcome": "Welcome", "t7": "T-7", "t7_reminder": "T-7 reminder", "t1": "T-1"}
@@ -42,7 +43,8 @@ BOOKING_DEFAULTS = {"language": "en", "adults": 2, "children": 0, "pets": 0, "oc
                     "pre_booked_services": []}
 
 # What Gia is asked to write when the 24-hour window is open and she can use free text instead of a template.
-_T7_ASK = "ask about arrival plans, confirm interest in services, and surface preferences"
+_T7_ASK = ("ask about arrival plans and services, and collect everyone's name, ID document status (UC-OPS-02; "
+          "note Form C for foreign nationals), dietary needs or allergies, and any children or pets")
 DIRECTIVES = {
     "welcome": ("Trigger: booking confirmed. Introduce yourself as Lohono's AI concierge, confirm the villa and "
                 "dates, and say they can message any time or ask for a person."),
@@ -52,7 +54,9 @@ DIRECTIVES = {
     "t7_reminder": ("Trigger: T-7 follow-up. The guest has not replied to your pre-arrival message. Send one brief, "
                     "warm reminder asking about arrival plans and anything to arrange."),
     "t1": ("Trigger: T-1, the day before check-in. Confirm the guest's arrival time, handle any final requests, "
-           "and share the villa's directions, map link and the on-ground contact (call get_villa_info first)."),
+           "and share the villa's directions, map link and the on-ground contact (call get_villa_info first). "
+           "If ID document status or any guest names are still missing from Guest context, ask for them once more; "
+           "if the guest can't share them now, say the team will collect it at check-in."),
 }
 
 
@@ -142,7 +146,7 @@ def on_booking_event(event: str, data: dict) -> dict:
 def parse_settings(raw: dict) -> dict:
     """Read the console's settings form. Blank fields (and 'keep') leave the villa's value unchanged."""
     changes: dict = {}
-    for key in ("enabled", "reminder_enabled", "flag_no_reply"):
+    for key in ("enabled", "reminder_enabled", "flag_no_reply", "flag_missing_ids"):
         if raw.get(key) in ("on", "off"):
             changes[key] = raw[key] == "on"
     for key, lo, hi in (("t7_days", 2, 30), ("t1_days", 1, 3), ("reminder_hours", 1, 72)):
@@ -244,6 +248,11 @@ async def _process(step: dict, force: bool = False) -> None:
             and not store.guest_replied_since(phone, pre_arrival_at):
         await _flag_no_reply(booking, pre_arrival_at)
 
+    # UC-OPS-02 exception: ID documents still missing at T-1 go to the villa team to collect at check-in.
+    if name == "t1" and attempts == 1 and s["flag_missing_ids"] \
+            and not (store.guest_details(bid).get("id_documents") or "").strip():
+        await _flag_missing_ids(booking)
+
     merged = name == "welcome" and _is_merged(steps)
     try:
         wa_message_id, channel, sent_as = await _send(booking, name, merged)
@@ -328,6 +337,25 @@ async def _flag_no_reply(booking: dict, pre_arrival_at: str) -> None:
         source="uc-ops-01", assignee=assignee)
     messaged = await tickets.alert_staff(booking, t, f"no reply from guest {first} before arrival")
     store.audit(booking["booking_id"], "t1_no_reply_flagged", "tier0",
+                {"ticket": t["ref"], "assigned_to": assignee, "whatsapp_alerts": messaged})
+
+
+async def _flag_missing_ids(booking: dict) -> None:
+    """UC-OPS-02 exception: ID documents still missing at T-1 are flagged to the villa host to collect
+    at check-in (Form C, for a foreign national, is completed from the physical document on arrival)."""
+    staff = store.staff_for_villa(booking["villa_id"])
+    host = (store.get_villa(booking["villa_id"]) or {}).get("host") or {}
+    assignee = ", ".join(f"{p['name']} ({role})" for role, p in staff.items()) \
+        or host.get("name", "Villa host")
+    first = booking["guest_name"].split()[0]
+    t = tickets.raise_ticket(
+        booking, booking["guest_phone"], "pre_arrival", "medium",
+        f"Collect ID documents from {first} at check-in",
+        ("Gia has not received ID document status from the guest before T-1. Please collect and verify ID "
+         "documents at check-in (Form C registration from the passport, for a foreign national)."),
+        source="uc-ops-02", assignee=assignee)
+    messaged = await tickets.alert_staff(booking, t, f"ID documents still outstanding for {first}, collect at check-in")
+    store.audit(booking["booking_id"], "uc_ops_02_ids_missing_flagged", "tier0",
                 {"ticket": t["ref"], "assigned_to": assignee, "whatsapp_alerts": messaged})
 
 
