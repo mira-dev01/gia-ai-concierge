@@ -48,6 +48,22 @@
       "vip": false,
       "status": "confirmed",
       "pre_booked_services": ["Breakfast (included)", "Private chef (included for 10+)"]
+    },
+    {
+      "booking_id": "LH-24110",
+      "villa_id": "ALB-AWS-02",
+      "guest_name": "Mithil",
+      "guest_phone": "919850832078",
+      "language": "en",
+      "check_in": "2026-10-26",
+      "check_out": "2026-10-29",
+      "adults": 2,
+      "children": 0,
+      "pets": 0,
+      "occasion": null,
+      "vip": false,
+      "status": "confirmed",
+      "pre_booked_services": ["Breakfast (included)"]
     }
   ]
 }
