@@ -57,7 +57,7 @@ export function ChatItem(m, i, arr) {
   switch (m.kind) {
     case 'date': return h`<div key=${key} className="chat-date">${m.text}</div>`;
     // m.who names the sender when it isn't the guest, Gia or ops (an operator's thread)
-    case 'guest': return h`<div key=${key} className="bubble guest">${m.who ? !sameSenderAsPrev && h`<div className="who">${m.who}</div>` : h`<span className="sr-only">Guest: </span>`}${waText(m.text)}${foot}</div>`;
+    case 'guest': return h`<div key=${key} className="bubble guest" data-msg=${m.id}>${m.who ? !sameSenderAsPrev && h`<div className="who">${m.who}</div>` : h`<span className="sr-only">Guest: </span>`}${waText(m.text)}${foot}</div>`;
     case 'gia': return h`<div key=${key} className=${'bubble gia' + (m.delivery === 'failed' ? ' failed' : '')}>${!sameSenderAsPrev && h`<div className="who">${m.who || 'Gia · AI concierge'}</div>`}${waText(m.text)}${foot}</div>`;
     case 'ops': return h`<div key=${key} className=${'bubble ops' + (m.delivery === 'failed' ? ' failed' : '')}>${!sameSenderAsPrev && h`<div className="who">${m.who || 'Ops team · human'}</div>`}${waText(m.text)}${m.time && foot}</div>`;
     case 'note': return h`<div key=${key} className="chat-note">${m.text}${m.time && h` · ${m.time}`}</div>`;

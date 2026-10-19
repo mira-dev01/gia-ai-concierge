@@ -7,6 +7,7 @@ The SQL is written once with ? placeholders and works on both."""
 import atexit
 import json
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -100,6 +101,8 @@ def init() -> None:
             CREATE TABLE IF NOT EXISTS preferences (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, booking_id TEXT, guest_name TEXT,
                 category TEXT, preference TEXT, source_quote TEXT, at TEXT);
+            CREATE TABLE IF NOT EXISTS guest_profiles (
+                guest_id TEXT PRIMARY KEY, name TEXT, phone TEXT, created_at TEXT, updated_at TEXT);
             CREATE TABLE IF NOT EXISTS guest_details (
                 booking_id TEXT PRIMARY KEY, details TEXT, updated_at TEXT);
             CREATE TABLE IF NOT EXISTS handoffs (
@@ -155,6 +158,18 @@ def init() -> None:
         c.execute("CREATE INDEX IF NOT EXISTS transcript_booking ON transcript (booking_id)")
         c.execute("CREATE INDEX IF NOT EXISTS transcript_wamid ON transcript (wa_message_id)")
         c.execute("CREATE INDEX IF NOT EXISTS audit_booking ON audit (booking_id)")
+        # UC-OPS-09: preferences belong to the guest's profile (every stay, every villa), and each one links back
+        # to the guest message it came from (transcript id) and how it was captured (whatsapp, console, terminal).
+        _add_column(c, "preferences", "guest_id", "TEXT")
+        _add_column(c, "preferences", "kind", "TEXT")  # like, dislike or arrangement
+        _add_column(c, "preferences", "source", "TEXT")
+        _add_column(c, "preferences", "message_id", "INTEGER")
+        _add_column(c, "preferences", "dedupe_key", "TEXT")
+        _add_column(c, "preferences", "retired_at", "TEXT")  # no longer holds; kept for the record
+        _add_column(c, "preferences", "retired_message_id", "INTEGER")
+        c.execute("CREATE INDEX IF NOT EXISTS preferences_guest ON preferences (guest_id)")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS preferences_dedupe ON preferences (guest_id, dedupe_key)")
+        c.execute("CREATE INDEX IF NOT EXISTS transcript_phone ON transcript (phone)")
         # Sample bookings count as confirmed the first time the service sees them. An edit to bookings.json
         # is applied on the next start; otherwise changes made by OI events are kept.
         for b in _seed_bookings:
@@ -167,6 +182,31 @@ def init() -> None:
             c.execute("INSERT INTO bookings (booking_id, data, updated_at) VALUES (?, ?, ?) ON CONFLICT(booking_id) "
                       "DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
                       (b["booking_id"], json.dumps(merged, ensure_ascii=False), now().isoformat()))
+    _backfill_preferences()
+
+
+def _backfill_preferences() -> None:
+    """Preferences saved before guest profiles: put each on its guest's profile and link it to the guest message
+    its quote came from, else the guest's last message before it was saved (the one Gia was answering). A repeat of
+    one already on the profile is kept, marked removed. Runs once per row (only rows without a guest_id)."""
+    with _db() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM preferences WHERE guest_id IS NULL").fetchall()]
+    for p in rows:
+        booking = get_booking(p["booking_id"]) if p["booking_id"] else None
+        if not booking:
+            continue
+        guest_id = guest_id_for(booking)
+        msg = inbound_message_matching(booking["guest_phone"], p["source_quote"] or "") \
+            or last_inbound_message(booking["guest_phone"], p["at"])
+        key = preference_key(p["kind"] or "like", p["category"] or "other", p["preference"] or "")
+        with _db() as c:
+            taken = c.execute("SELECT 1 FROM preferences WHERE guest_id = ? AND dedupe_key = ?",
+                              (guest_id, key)).fetchone()
+            c.execute("UPDATE preferences SET guest_id = ?, kind = COALESCE(kind, 'like'), message_id = ?, "
+                      "dedupe_key = ?, retired_at = ? WHERE id = ?",
+                      (guest_id, msg["id"] if msg else None, None if taken else key,
+                       now().isoformat() if taken else None, p["id"]))
+        upsert_guest_profile(booking)
 
 
 def _add_column(c: _Conn, table: str, column: str, kind: str) -> None:
@@ -467,14 +507,82 @@ def _ticket_view(row) -> dict:
 
 
 # ---- guest profile: preferences (UC-OPS-09) and arrival details (UC-OPS-02) ----
+# A guest profile spans every booking the guest makes, at any villa. Until OI sends a guest ID with its bookings,
+# the guest is identified by their WhatsApp number.
 
-def add_preference(booking: dict, category: str, preference: str, source_quote: str) -> None:
+def guest_id_for(booking: dict) -> str:
+    return str(booking.get("guest_id") or booking["guest_phone"])
+
+
+def normalize(text: str) -> str:
+    """Lower-case words without punctuation, for matching a quote to a message and spotting repeats.
+    Keeps letters and combining marks of any script (Devanagari vowel signs are marks, not punctuation)."""
+    kept = "".join(ch if unicodedata.category(ch)[0] in "LMN" else " " for ch in (text or "").casefold())
+    return " ".join(kept.split())
+
+
+def preference_key(kind: str, category: str, preference: str) -> str:
+    return f"{kind}:{category}:{normalize(preference)}"
+
+
+def upsert_guest_profile(booking: dict) -> dict:
+    guest_id, at = guest_id_for(booking), now().isoformat()
     with _db() as c:
-        c.execute(
-            "INSERT INTO preferences (booking_id, guest_name, category, preference, source_quote, at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (booking["booking_id"], booking["guest_name"], category, preference, source_quote, now().isoformat()),
-        )
+        c.execute("INSERT INTO guest_profiles (guest_id, name, phone, created_at, updated_at) VALUES (?, ?, ?, ?, ?) "
+                  "ON CONFLICT(guest_id) DO UPDATE SET name = excluded.name, phone = excluded.phone, "
+                  "updated_at = excluded.updated_at",
+                  (guest_id, booking["guest_name"], booking["guest_phone"], at, at))
+        return dict(c.execute("SELECT * FROM guest_profiles WHERE guest_id = ?", (guest_id,)).fetchone())
+
+
+def get_guest_profile(guest_id: str) -> dict | None:
+    with _db() as c:
+        row = c.execute("SELECT * FROM guest_profiles WHERE guest_id = ?", (guest_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def save_preference(guest_id: str, booking: dict, kind: str, category: str, preference: str, source_quote: str,
+                    source: str, message_id: int) -> tuple[dict, str]:
+    """Put a preference on the guest's profile. Returns (the row, outcome): 'added'; 'renewed' when it had been
+    removed and the guest has said it again (its source moves to the new message); 'exists' when it's already
+    on the profile (unchanged, so it keeps linking to where the guest first said it)."""
+    key, at = preference_key(kind, category, preference), now().isoformat()
+    with _db() as c:
+        before = c.execute("SELECT retired_at FROM preferences WHERE guest_id = ? AND dedupe_key = ?",
+                           (guest_id, key)).fetchone()
+        changed = c.execute(
+            "INSERT INTO preferences (booking_id, guest_name, category, preference, source_quote, at, guest_id, kind, "
+            "source, message_id, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (guest_id, dedupe_key) DO UPDATE SET booking_id = excluded.booking_id, "
+            "preference = excluded.preference, source_quote = excluded.source_quote, at = excluded.at, "
+            "source = excluded.source, message_id = excluded.message_id, retired_at = NULL, retired_message_id = NULL "
+            "WHERE preferences.retired_at IS NOT NULL",
+            (booking["booking_id"], booking["guest_name"], category, preference, source_quote, at, guest_id, kind,
+             source, message_id, key)).rowcount == 1
+        row = dict(c.execute("SELECT * FROM preferences WHERE guest_id = ? AND dedupe_key = ?",
+                             (guest_id, key)).fetchone())
+    return row, ("exists" if not changed else "renewed" if before else "added")
+
+
+def get_preference(preference_id: int) -> dict | None:
+    with _db() as c:
+        row = c.execute("SELECT * FROM preferences WHERE id = ?", (preference_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def retire_preference(preference_id: int, message_id: int) -> dict | None:
+    with _db() as c:
+        c.execute("UPDATE preferences SET retired_at = ?, retired_message_id = ? WHERE id = ? AND retired_at IS NULL",
+                  (now().isoformat(), message_id, preference_id))
+    return get_preference(preference_id)
+
+
+def preferences_for_guest(guest_id: str) -> list[dict]:
+    """What's on the guest's profile now (removed ones left out), oldest first."""
+    with _db() as c:
+        rows = c.execute("SELECT * FROM preferences WHERE guest_id = ? AND retired_at IS NULL ORDER BY id",
+                         (guest_id,)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def all_preferences() -> list[dict]:
@@ -581,6 +689,33 @@ def booking_record(booking_id: str) -> dict:
             "preferences": q("SELECT * FROM preferences WHERE booking_id = ? ORDER BY id"),
             "audit": q("SELECT * FROM audit WHERE booking_id = ? ORDER BY id DESC"),
         }
+
+
+def get_message(message_id: int) -> dict | None:
+    with _db() as c:
+        row = c.execute("SELECT * FROM transcript WHERE id = ?", (message_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def inbound_message_matching(phone: str, quote: str, limit: int = 50) -> dict | None:
+    """The guest's latest message (of their last `limit`) that contains these words, ignoring case and punctuation."""
+    words = normalize(quote)
+    if not words:
+        return None
+    with _db() as c:
+        rows = c.execute("SELECT * FROM transcript WHERE phone = ? AND direction = 'in' ORDER BY id DESC LIMIT ?",
+                         (phone, limit)).fetchall()
+    return next((dict(r) for r in rows if f" {words} " in f" {normalize(r['body'])} "), None)  # whole words only
+
+
+def last_inbound_message(phone: str, at: str | None) -> dict | None:
+    """The guest's last message at or before this time."""
+    if not at:
+        return None
+    with _db() as c:
+        row = c.execute("SELECT * FROM transcript WHERE phone = ? AND direction = 'in' AND at <= ? "
+                        "ORDER BY id DESC LIMIT 1", (phone, at)).fetchone()
+    return dict(row) if row else None
 
 
 def guest_replied_since(phone: str, since_iso: str) -> bool:

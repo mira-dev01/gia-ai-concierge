@@ -5,7 +5,7 @@ import logging
 
 from groq import AsyncGroq
 
-from . import config, store, tickets
+from . import config, preferences, store, tickets
 
 log = logging.getLogger("gia.agent")
 
@@ -31,6 +31,9 @@ What you can do
    - Requests for a service still need confirmation from the provider: say "I've requested it and will confirm shortly", not "it's booked".
 3. Collect arrival details before check-in (UC-OPS-02), starting at T-7: guest names, ID document status for every adult (for a foreign national, note that Form C registration will be completed from their passport at check-in), arrival time, transport needs, dietary needs, allergies, occasions, and children or pet details. Ask naturally, one or two things at a time, never as a form. Save each detail as you learn it with save_arrival_details, not all at once. "Guest context" below shows what's already captured; don't re-ask for it.
 4. Log preferences (UC-OPS-09): whenever the guest reveals a lasting preference (food, room setup, activities, occasions, routines), call log_preference with the guest's own words as the source quote. Do this silently; don't announce it.
+3. Collect arrival details before check-in (UC-OPS-02): arrival time, transport needs, guest names, dietary needs, allergies, occasions, children and pet details. Ask naturally, one or two things at a time, never as a form, and never ask for something the guest profile already has. Save what you learn with save_arrival_details.
+4. Keep the guest profile (UC-OPS-09). Whenever a message, a request or feedback shows something lasting about what the guest likes, dislikes or wants arranged (food and diet, room setup, activities, occasions, routines), call log_preference with kind like, dislike or arrangement, a short normalized preference, and source_quote copied exactly from the guest's message, in the language they wrote it. Requests count ("a chef tonight, we love seafood" is a request and a food like), and so does feedback ("the pillows were too soft" means firm pillows). Lasting diets and allergies go on the profile too, as well as in the arrival details. Don't log one-off needs ("extra towels now") or anything already on the profile. Do this silently; don't announce it. A preference on its own is not a request: acknowledge it briefly, and never say you're arranging or passing on something unless the guest asked for it and you created a ticket.
+   The guest profile in the guest context is what this guest told Lohono in earlier chats and stays, at any of our villas. Use it: never ask again for something on it, apply it to their requests, and put the relevant items in the ticket details so the villa team prepares for them. If the guest says something on it no longer holds, call remove_preference with its id (and log_preference for what replaces it).
 5. Hand off to a person (UC-OPS-10) with handoff_to_human when: the guest asks for a person; the guest is clearly upset or the same issue failed twice; anything involving safety, a medical issue, police, a fire, a gas leak, an injury or a missing person (urgency "urgent"). For safety or medical issues, tell the guest a named person is taking over right away and give the on-ground contact's phone number from the villa data; for medical emergencies also tell them to call 112.
 6. Report status: use get_my_tickets when the guest asks about an earlier request.
 
@@ -94,11 +97,26 @@ TOOL_SPECS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "category": {"type": "string", "enum": ["food", "room_setup", "activities", "occasions", "routine", "other"]},
-                "preference": {"type": "string", "description": "Normalized, e.g. 'Prefers Jain food, no onion or garlic'."},
-                "source_quote": {"type": "string", "description": "The guest's own words this came from."},
+                "kind": {"type": "string", "enum": list(preferences.KINDS),
+                         "description": "like: something they enjoy; dislike: something to avoid; arrangement: how they want things set up or done."},
+                "category": {"type": "string", "enum": list(preferences.CATEGORIES)},
+                "preference": {"type": "string", "description": "Short and normalized, e.g. 'Jain food, no onion or garlic', 'Firm pillows', 'Dislikes spicy food'."},
+                "source_quote": {"type": "string", "description": "The guest's own words, copied exactly from their message."},
             },
-            "required": ["category", "preference", "source_quote"],
+            "required": ["kind", "category", "preference", "source_quote"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "remove_preference",
+        "description": "Take a preference off the guest's profile because the guest said it no longer holds.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "preference_id": {"type": "integer", "description": "The id from the guest profile in the guest context."},
+                "source_quote": {"type": "string", "description": "The guest's own words saying it changed, copied exactly."},
+            },
+            "required": ["preference_id", "source_quote"],
             "additionalProperties": False,
         },
     },
@@ -122,7 +140,8 @@ TOOLS = [{"type": "function", "function": {"name": t["name"], "description": t["
 
 # Approval tier of each action (BRD section 9); everything Gia does here is Tier 0.
 TIERS = {name: "tier0" for name in ("get_villa_info", "create_ticket", "get_my_tickets",
-                                    "save_arrival_details", "log_preference", "handoff_to_human")}
+                                    "save_arrival_details", "log_preference", "remove_preference",
+                                    "handoff_to_human")}
 
 
 def _booking_context(booking: dict | None) -> str:
@@ -147,11 +166,14 @@ def _booking_context(booking: dict | None) -> str:
         "vip": booking.get("vip"),
         "pre_booked_services": booking.get("pre_booked_services", []),
         "arrival_details_captured_so_far": store.guest_details(booking["booking_id"]) or "none yet",
+        # UC-OPS-09: what the guest told Lohono before, on this stay or any earlier one, at any villa
+        "guest_profile": preferences.for_agent(booking),
     }, ensure_ascii=False, indent=1)
 
 
-def _run_tool(name: str, args: dict, booking: dict | None, phone: str) -> dict:
-    """Execute one tool. The booking is bound server-side from the sender's number, never from model input."""
+def _run_tool(name: str, args: dict, booking: dict | None, phone: str, source: dict | None = None) -> dict:
+    """Execute one tool. The booking is bound server-side from the sender's number, never from model input.
+    source is the guest message this turn answers ({"message_id", "channel"}), None when Gia opens the chat."""
     booking_id = booking["booking_id"] if booking else None
     store.audit(booking_id, name, TIERS.get(name, "tier0"), args)
 
@@ -182,18 +204,22 @@ def _run_tool(name: str, args: dict, booking: dict | None, phone: str) -> dict:
     if name == "save_arrival_details":
         return {"saved": store.update_guest_details(booking_id, args)}
     if name == "log_preference":
-        store.add_preference(booking, args["category"], args["preference"], args["source_quote"])
-        return {"logged": True}
+        return preferences.log(booking, phone, args.get("kind", ""), args.get("category", ""),
+                               args.get("preference", ""), args.get("source_quote", ""), source)
+    if name == "remove_preference":
+        return preferences.remove(booking, phone, int(args["preference_id"]), args.get("source_quote", ""), source)
     return {"error": f"Unknown tool {name}"}
 
 
-async def reply(phone: str, text: str) -> str:
-    """Take one guest message, run Gia, and return the reply text to send on WhatsApp."""
+async def reply(phone: str, text: str, source: dict | None = None) -> str:
+    """Take one guest message, run Gia, and return the reply text to send on WhatsApp. source names the logged
+    message ({"message_id": transcript id, "channel": whatsapp | console | terminal}), so what Gia saves from it
+    (UC-OPS-09 preferences) links back to it."""
     stamp = store.now().strftime("%A %d %b %Y, %H:%M IST")
     context = f"now {stamp}"
     for note in store.pop_notes(phone):
         context += f"; since your last message: {note}"
-    return await _turn(phone, f"[context: {context}]\n{text}", f"Model declined to answer: {text}")
+    return await _turn(phone, f"[context: {context}]\n{text}", f"Model declined to answer: {text}", source)
 
 
 async def initiate(phone: str, directive: str) -> str:
@@ -214,7 +240,7 @@ def record_outbound(phone: str, booking_id: str | None, text: str) -> None:
     store.save_history(phone, booking_id, messages)
 
 
-async def _turn(phone: str, user_content: str, refusal_reason: str) -> str:
+async def _turn(phone: str, user_content: str, refusal_reason: str, source: dict | None = None) -> str:
     """Run one agent turn (tool-use loop included) and return the text to send to the guest."""
     booking = store.find_booking(phone)
     messages = store.load_history(phone)
@@ -241,7 +267,7 @@ async def _turn(phone: str, user_content: str, refusal_reason: str) -> str:
         if response.choices[0].finish_reason == "content_filter":
             final_text = ("Sorry, I can't help with that here. Let me connect you with someone from the "
                           "Lohono team.")
-            _run_tool("handoff_to_human", {"reason": refusal_reason, "urgency": "normal"}, booking, phone)
+            _run_tool("handoff_to_human", {"reason": refusal_reason, "urgency": "normal"}, booking, phone, source)
             break
 
         if not msg.tool_calls:
@@ -251,7 +277,7 @@ async def _turn(phone: str, user_content: str, refusal_reason: str) -> str:
         for tc in msg.tool_calls:
             try:
                 args = json.loads(tc.function.arguments or "{}")
-                out = _run_tool(tc.function.name, args, booking, phone)
+                out = _run_tool(tc.function.name, args, booking, phone, source)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(out, ensure_ascii=False)})
             except Exception as e:  # report tool errors to the model instead of failing the turn
                 log.exception("tool %s failed", tc.function.name)

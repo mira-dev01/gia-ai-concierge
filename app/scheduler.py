@@ -12,7 +12,7 @@ Once the guest replies, Gia carries the conversation on in free text.
 import logging
 from datetime import date, datetime, time, timedelta
 
-from . import agent, store, tickets, wa_templates, whatsapp
+from . import agent, preferences, store, tickets, wa_templates, whatsapp
 
 log = logging.getLogger("gia.uc_ops_01")
 
@@ -57,6 +57,17 @@ DIRECTIVES = {
            "and share the villa's directions, map link and the on-ground contact (call get_villa_info first). "
            "If ID document status or any guest names are still missing from Guest context, ask for them once more; "
            "if the guest can't share them now, say the team will collect it at check-in."),
+}
+
+# Added when the guest profile already has preferences (UC-OPS-09): from an earlier stay for the welcome, from any
+# conversation for T-7, so the guest is never asked again for what they've told us.
+RETURNING = {
+    "welcome": ("This guest has stayed with Lohono before, and the guest profile in your context has their "
+                "preferences. Welcome them back, say in a few words that you've kept their preferences (name one or "
+                "two), and only ask whether anything has changed; don't ask again for anything already on the profile."),
+    "t7": ("The guest profile in your context already has this guest's preferences. Say in a few words that you're "
+           "preparing their stay around them (name one or two) and only ask whether anything has changed; don't "
+           "ask again for anything already on the profile."),
 }
 
 
@@ -271,8 +282,11 @@ async def _send(booking: dict, name: str, merged: bool) -> tuple[str | None, str
     phone, bid = booking["guest_phone"], booking["booking_id"]
     last_in = _parse_dt(store.last_inbound_at(phone))
     if last_in and store.now() - last_in < timedelta(hours=SERVICE_WINDOW_HOURS):
+        directive = DIRECTIVES["welcome_merged" if merged else name]
+        if name in RETURNING and _known(booking, name):
+            directive += " " + RETURNING[name]
         try:
-            text = await agent.initiate(phone, DIRECTIVES["welcome_merged" if merged else name])
+            text = await agent.initiate(phone, directive)
         except Exception:
             log.exception("Gia couldn't write the %s message for %s; sending the template instead", name, bid)
             text = None
@@ -286,29 +300,50 @@ async def _send(booking: dict, name: str, merged: bool) -> tuple[str | None, str
                     raise
                 log.info("Service window closed for %s; sending the %s template instead", bid, name)
 
-    template, values = _template_for(booking, name, merged)
-    result, text, sent_as = await wa_templates.send(phone, template, values, booking.get("language") or "en")
+    template, values, fallback = _template_for(booking, name, merged)
+    result, text, sent_as = await wa_templates.send(phone, template, values, booking.get("language") or "en",
+                                                    fallback=fallback)
     wa_message_id = whatsapp.message_id(result)
     agent.record_outbound(phone, bid, text)
     _log_sent(booking, name, text, "template", sent_as, merged, wa_message_id)
     return wa_message_id, "template", sent_as
 
 
-def _template_for(booking: dict, name: str, merged: bool) -> tuple[wa_templates.Template, list]:
+def _template_for(booking: dict, name: str, merged: bool) \
+        -> tuple[wa_templates.Template, list, tuple[wa_templates.Template, list] | None]:
+    """The step's template and values, and the standard one to fall back on when a returning guest's template
+    isn't approved yet."""
     villa = store.get_villa(booking["villa_id"]) or {}
     first = booking["guest_name"].split()[0]
     villa_name = villa.get("name", booking["villa_id"])
     check_in, check_out = _nice_date(booking["check_in"]), _nice_date(booking["check_out"])
     if name == "welcome":
-        return (wa_templates.WELCOME_PRE_ARRIVAL if merged else wa_templates.WELCOME), \
-            [first, villa_name, check_in, check_out]
+        template = wa_templates.WELCOME_PRE_ARRIVAL if merged else wa_templates.WELCOME
+        values = [first, villa_name, check_in, check_out]
+        return _returning(booking, name, wa_templates.WELCOME_RETURNING, template, values)
     if name == "t7":
-        return wa_templates.PRE_ARRIVAL, [first, villa_name, check_in]
+        return _returning(booking, name, wa_templates.PRE_ARRIVAL_RETURNING, wa_templates.PRE_ARRIVAL,
+                          [first, villa_name, check_in])
     if name == "t7_reminder":
-        return wa_templates.PRE_ARRIVAL_REMINDER, [first, villa_name, check_in]
+        return wa_templates.PRE_ARRIVAL_REMINDER, [first, villa_name, check_in], None
     contact = store.on_ground_contact(booking["villa_id"])
     return wa_templates.ARRIVAL, [first, villa_name, check_in, villa.get("check_in_time"), villa.get("directions"),
-                                  villa.get("maps_url"), contact.get("name"), contact.get("phone")]
+                                  villa.get("maps_url"), contact.get("name"), contact.get("phone")], None
+
+
+def _known(booking: dict, name: str) -> list[dict]:
+    """What the step's message can say is already known: the welcome, what the guest said on earlier stays (its
+    template says so); T-7, everything on the profile, including what they've said since booking."""
+    return preferences.remembered(booking) if name == "welcome" else preferences.on_profile(booking)
+
+
+def _returning(booking: dict, name: str, returning: wa_templates.Template, standard: wa_templates.Template,
+               values: list):
+    """A guest whose preferences are already known gets the template that lists them instead of asking again."""
+    known = _known(booking, name)
+    if not known:
+        return standard, values, None
+    return returning, [*values, preferences.summary(known)], (standard, values)
 
 
 def _log_sent(booking: dict, name: str, text: str, channel: str, template: str | None, merged: bool,

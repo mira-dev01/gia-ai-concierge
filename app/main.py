@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Red
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
-from . import agent, config, operators, ops_view, property_view, scheduler, store, tickets, whatsapp
+from . import agent, config, operators, ops_view, preferences, property_view, scheduler, store, tickets, whatsapp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("gia")
@@ -122,12 +122,14 @@ async def _converse(phone: str, text: str, send: bool) -> str:
     async with _locks[phone]:
         booking = store.find_booking(phone)
         booking_id = booking["booking_id"] if booking else None
-        store.log_message(phone, booking_id, "in", text)
+        message_id = store.log_message(phone, booking_id, "in", text)
         if store.takeover_active(phone):  # a person from ops is replying; Gia catches up when they hand back
             store.add_note(phone, f"while the ops team was handling the chat, the guest wrote: \"{text}\"")
             return ""
         try:
-            answer = await agent.reply(phone, text)
+            # What Gia saves from this message (UC-OPS-09 preferences) links back to it.
+            answer = await agent.reply(phone, text, source={"message_id": message_id,
+                                                            "channel": "whatsapp" if send else "console"})
         except Exception:
             log.exception("Gia failed for %s", phone)
             tickets.raise_handoff(booking, phone, f"Gia errored on: {text}", "normal")  # NFR-08
@@ -254,6 +256,24 @@ def _coverage(all_steps: dict, booking_ids: set[str]) -> str:
     return f"<p>{' · '.join(lines)}</p>"
 
 
+def _preferences_table(prefs: list[dict], with_guest: bool = False) -> str:
+    """Preferences with a link to the guest message each came from (UC-OPS-09 acceptance)."""
+    if not prefs:
+        return "<p class=muted>Nothing yet.</p>"
+    rows = ""
+    for x in prefs:
+        link = (f"<a href=/admin/bookings/{_e(x['booking_id'])}#m{x['message_id']}>{_e(x['booking_id'])} · "
+                f"message {x['message_id']}</a> · {_e(x.get('source') or '')}" if x.get("message_id")
+                else "<span class=muted>no message linked</span>")
+        removed = " <span class=muted>(removed)</span>" if x.get("retired_at") else ""
+        rows += (f"<tr><td>{_e(_short(x['at']))}</td>" + (f"<td>{_e(x['guest_name'])}</td>" if with_guest else "")
+                 + f"<td>{_e(x.get('kind') or 'like')}</td><td>{_e(x['category'])}</td>"
+                 f"<td>{_e(x['preference'])}{removed}</td><td>“{_e(x['source_quote'])}”</td><td>{link}</td></tr>")
+    head = "".join(f"<th>{c}</th>" for c in ["at", *(["guest"] if with_guest else []), "kind", "category",
+                                            "preference", "guest's words", "source"])
+    return f"<table><tr>{head}</tr>{rows}</table>"
+
+
 @app.get("/admin/bookings/{booking_id}", response_class=HTMLResponse, dependencies=[Depends(admin)])
 async def booking_page(booking_id: str):
     """Everything on one booking: the UC-OPS-01 journey, every message both ways, tickets and preferences."""
@@ -265,7 +285,7 @@ async def booking_page(booking_id: str):
     steps = store.steps_for_booking(booking_id)
     journey = [{**steps[name], "step": scheduler.STEP_LABELS[name]} for name in scheduler.STEPS if name in steps]
     chat = "".join(
-        f"<div class={m['direction']}><span class=muted>{_e(_short(m['at']))} "
+        f"<div class={m['direction']} id=m{m['id']}><span class=muted>{_e(_short(m['at']))} "
         f"{ {'in': 'guest', 'ops': 'ops team'}.get(m['direction'], 'Gia')}</span> {_e(m['body'])}</div>"
         for m in rec["messages"])
     staff = store.staff_for_villa(b["villa_id"])
@@ -286,7 +306,9 @@ async def booking_page(booking_id: str):
                                   "assignee"])
         + "<h2>Handoffs</h2>" + _table(rec["handoffs"], ["id", "at", "urgency", "reason", "status"])
         + "<h2>Arrival details</h2><p>" + (_e(d) if (d := store.guest_details(booking_id)) else "None yet.") + "</p>"
-        + "<h2>Preferences</h2>" + _table(rec["preferences"], ["at", "category", "preference", "source_quote"])
+        + "<h2>Guest profile (UC-OPS-09)</h2><p class=muted>Everything this guest has told Gia, on any stay at any "
+          "villa. Source opens the message it came from.</p>"
+        + _preferences_table(preferences.profile(b)["preferences"])
         + "<h2>Audit trail</h2>" + _table(rec["audit"], ["at", "action", "tier", "data"])
     )
     return _page(body)
@@ -370,8 +392,8 @@ async def dashboard(msg: str = ""):
                   for b in store.all_bookings())
         + "</select> <input name=text size=60 placeholder='Can we get a private chef tomorrow night?'> "
           "<button>Send as guest</button></form>"
-        + "<h2>Preferences captured</h2>"
-        + _table(store.all_preferences(), ["at", "guest_name", "category", "preference", "source_quote"])
+        + "<h2>Preferences captured (guest profiles)</h2>"
+        + _preferences_table(store.all_preferences(), with_guest=True)
         + "<h2>Bookings and arrival details</h2>"
         + _table(bookings, ["booking_id", "guest_name", "guest_phone", "villa_id", "check_in", "check_out",
                             "status", "confirmed_at", "details"], booking_actions)

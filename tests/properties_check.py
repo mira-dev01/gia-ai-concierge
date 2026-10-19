@@ -39,7 +39,7 @@ async def fake_post(payload):
 whatsapp._post = fake_post
 
 
-async def fake_reply(phone, text):
+async def fake_reply(phone, text, source=None):
     return f"Gia: {text}"
 
 agent.reply = fake_reply

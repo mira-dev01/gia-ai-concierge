@@ -1,13 +1,21 @@
-"""WhatsApp message templates Gia uses for UC-OPS-01.
+"""WhatsApp message templates Gia uses for UC-OPS-01, and for returning guests (UC-OPS-09).
 
-All six are approved in WhatsApp Manager (category Utility, language English "en"); the bodies and buttons
-here are copied from the approved versions. The bodies are also used to log the exact text the guest received
-against the booking, so if a template is edited in Meta, update it here too.
+The first six are approved in WhatsApp Manager (category Utility, language English "en"); the bodies and buttons
+here are copied from the approved versions. The two returning-guest templates are to be submitted with exactly
+these bodies; until Meta approves them, the standard welcome or pre-arrival template goes out in their place.
+The bodies are also used to log the exact text the guest received against the booking, so if a template is
+edited in Meta, update it here too.
 """
 
+import logging
 from dataclasses import dataclass
 
 from . import config, whatsapp
+
+log = logging.getLogger("gia.templates")
+
+# Meta's answer when a template doesn't exist (not approved yet), is paused or is disabled.
+UNAVAILABLE = {132001, 132015, 132016}
 
 
 @dataclass(frozen=True)
@@ -97,7 +105,33 @@ STAFF_ALERT = Template(  # to the villa's caretaker and manager, e.g. no guest r
     params=("what happened", "villa name", "guest name", "booking ID", "check-in date", "ticket reference"),
 )
 
-ALL = (WELCOME, WELCOME_PRE_ARRIVAL, PRE_ARRIVAL, PRE_ARRIVAL_REMINDER, ARRIVAL, STAFF_ALERT)
+# UC-OPS-09: a guest whose profile already has preferences from an earlier stay is told they're remembered, so
+# they don't have to repeat them. The preferences are the last parameter, so the standard template takes the
+# same values without it when these aren't available.
+WELCOME_RETURNING = Template(  # booking confirmed for a guest with a profile (also used when T-7 is merged in)
+    name="gia_welcome_returning",
+    meta_id="",  # set once approved
+    body=("Hi {{1}}, welcome back! Your stay at *{{2}}* from *{{3}}* to *{{4}}* is confirmed.\n\n"
+          "I'm Gia, Lohono Stays' AI concierge. From your earlier stays I've kept your preferences: *{{5}}*. "
+          "I'll share them with the villa team, so there's no need to repeat them.\n\n"
+          "Has anything changed? Reply with your arrival time and anything you'd like arranged. If you'd prefer "
+          "a person, just let me know."),
+    params=("guest first name", "villa name", "check-in date", "check-out date", "remembered preferences"),
+)
+
+PRE_ARRIVAL_RETURNING = Template(  # T-7 for a guest with a profile
+    name="gia_pre_arrival_returning",
+    meta_id="",  # set once approved
+    body=("Hi {{1}}, your stay at *{{2}}* begins on *{{3}}*.\n\n"
+          "I'm preparing your arrival with the villa team, using the preferences on your profile: *{{4}}*.\n\n"
+          "Could you share your arrival time and travel plans, and let me know if anything has changed or you'd "
+          "like something new arranged? You can also ask to speak with a person anytime."),
+    params=("guest first name", "villa name", "check-in date", "remembered preferences"),
+    buttons=("Share my plans", "Talk to a person"),
+)
+
+ALL = (WELCOME, WELCOME_PRE_ARRIVAL, PRE_ARRIVAL, PRE_ARRIVAL_REMINDER, ARRIVAL, STAFF_ALERT, WELCOME_RETURNING,
+       PRE_ARRIVAL_RETURNING)
 
 
 def clean(values: list) -> list[str]:
@@ -114,15 +148,22 @@ def render(template: Template, values: list[str]) -> str:
     return text
 
 
-async def send(to: str, template: Template, values: list, language: str = "en") -> tuple[dict, str, str]:
+async def send(to: str, template: Template, values: list, language: str = "en",
+               fallback: tuple[Template, list] | None = None) -> tuple[dict, str, str]:
     """Send a template. Returns (Meta's response, the text the guest sees, the template actually sent).
 
     Until WA_TEMPLATES_LIVE is on, Meta's hello_world goes out instead (test numbers accept only that),
-    while the real text is still returned so it can be logged.
+    while the real text is still returned so it can be logged. fallback (a template and its values) goes out
+    instead if Meta says the template isn't available, e.g. a new one still waiting for approval.
     """
     values = clean(values)
     text = render(template, values)
     if not config.WA_TEMPLATES_LIVE:
         return await whatsapp.send_template(to, "hello_world", "en_US"), text, "hello_world"
     lang = language if language in config.TEMPLATE_LANGS else "en"
-    return await whatsapp.send_template(to, template.name, lang, values), text, template.name
+    result = await whatsapp.send_template(to, template.name, lang, values)
+    if fallback and (result.get("error") or {}).get("code") in UNAVAILABLE:
+        log.warning("Template %s isn't available (%s); sending %s instead", template.name,
+                    result["error"].get("message"), fallback[0].name)
+        return await send(to, fallback[0], fallback[1], language)
+    return result, text, template.name

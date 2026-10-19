@@ -18,7 +18,13 @@ async def main() -> None:
     while True:
         text = input("guest> ").strip()
         if text:
-            print("gia>  " + (await agent.reply(phone, text)).replace("\n", "\n      ") + "\n")
+            # Logged like a WhatsApp message, so preferences Gia saves link back to it (UC-OPS-09).
+            b = store.find_booking(phone)
+            booking_id = b["booking_id"] if b else None
+            message_id = store.log_message(phone, booking_id, "in", text)
+            answer = await agent.reply(phone, text, source={"message_id": message_id, "channel": "terminal"})
+            store.log_message(phone, booking_id, "out", answer)
+            print("gia>  " + answer.replace("\n", "\n      ") + "\n")
 
 
 if __name__ == "__main__":

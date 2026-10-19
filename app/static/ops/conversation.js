@@ -7,11 +7,13 @@ import { h, Frag, ChatItem, Tone, State, Composer, stickToBottom, trackScroll } 
 
 const { React } = window;
 
+// UC-OPS-09: the guest profile, grouped the way ops reads it.
+const PREF_KINDS = [['like', 'Likes'], ['dislike', 'Dislikes'], ['arrangement', 'Arrangements']];
 const RELATION = { current: 'Current stay', next: 'Next arrival', upcoming: 'Upcoming stay', past: 'Past stay', other: 'Not a confirmed stay' };
 export const conversationLabel = c => `${c.guest} · ${c.check_in ? L.dateRange(c.check_in, c.check_out) : 'no dates'} · ${c.relation === 'other' ? c.label : RELATION[c.relation]}${c.messages ? '' : ' · no messages yet'}`;
 
 export class ConversationPanel extends React.Component {
-  state = { data: null, forId: null, loading: false, error: null, drafts: {}, sendError: null };
+  state = { data: null, forId: null, loading: false, error: null, drafts: {}, sendError: null, prefShown: null };
   logRef = React.createRef();
   fetch = L.latest();
   scroll = {};
@@ -47,6 +49,18 @@ export class ConversationPanel extends React.Component {
   setTakeover(b, on) {
     return this.props.ctx.act('takeover:' + b.id, () => L.api('POST', `/bookings/${encodeURIComponent(b.id)}/takeover`, { on }),
       () => on ? `You’re handling ${b.guest}’s chat. Gia is paused.` : `Handed back. Gia is replying to ${b.guest} again.`);
+  }
+
+  // A preference's source: say where and when the guest said it, and if that message is in this chat, go to it.
+  showSource(x) {
+    this.setState({ prefShown: x.id });
+    const log = this.logRef.current;
+    const el = x.booking_id === this.props.bookingId && log && log.querySelector(`[data-msg="${x.message_id}"]`);
+    if (!el) return;
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    el.classList.remove('flash');
+    void el.offsetWidth;  // restart the highlight if it's already running
+    el.classList.add('flash');
   }
 
   resolveHandoff(x) {
@@ -117,7 +131,16 @@ export class ConversationPanel extends React.Component {
           <dl className="kv">${ctxRows.map(([k, v]) => h`<${Frag} key=${k}><dt>${k}</dt><dd>${v}</dd><//>`)}
             ${!Object.keys(d.details || {}).length && h`<${Frag}><dt>Arrival</dt><dd className="missing">Not shared yet</dd><//>`}
           </dl>
-          ${d.preferences.length > 0 && h`<div className="prefs">${d.preferences.map((x, i) => h`<span key=${i} className="pref" title=${`${L.titleCase(x.category)} · “${x.source_quote}”`}>${x.preference}</span>`)}</div>`}
+          ${d.preferences.length > 0 && h`<div className="stack sm"><div className="eyebrow">Guest profile${d.profile.stays > 1 ? ` · ${d.profile.stays} stays` : ''}</div>
+            ${PREF_KINDS.map(([kind, label]) => {
+              const xs = d.preferences.filter(x => (x.kind || 'like') === kind);
+              return xs.length > 0 && h`<div key=${kind} className="prefs"><span className="pref-kind">${label}</span>
+                ${xs.map(x => h`<button key=${x.id} className="pref" aria-pressed=${s.prefShown === x.id} onClick=${() => this.showSource(x)}
+                  title="Show where the guest said this">${x.preference}</button>`)}
+              </div>`;
+            })}
+            ${(shown => shown && h`<div className="pref-source" role="status">${L.titleCase(shown.category)} · “${shown.source_quote}” · ${shown.booking_id === b.id ? 'this chat' : `${shown.villa || shown.booking_id} stay (${shown.booking_id})`}, ${L.whenFull(shown.at, now)}${shown.source && shown.source !== 'whatsapp' ? ` · via ${shown.source}` : ''}</div>`)(d.preferences.find(x => x.id === s.prefShown))}
+          </div>`}
           ${openRequests.length > 0 && h`<ul className="plain-list">${openRequests.map(t => h`<li key=${t.ref}>
             <button className="btn-link" onClick=${() => ctx.openTicket(t.ref)}>${t.ref}</button> ${t.summary} · ${L.STATUS_LABEL[t.status] || L.titleCase(t.status)}
           </li>`)}</ul>`}

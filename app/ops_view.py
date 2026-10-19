@@ -9,7 +9,7 @@ loaded on their own when someone opens them."""
 import json
 from datetime import datetime, timedelta
 
-from . import operators, portfolio, scheduler, store
+from . import operators, portfolio, preferences, scheduler, store
 
 MESSAGES_PER_BOOKING = 150
 MESSAGES_PER_OPERATOR = 100
@@ -93,7 +93,8 @@ def _operator_summary(p: dict, mine: list[dict], roles: list[dict], villas: dict
 
 def conversation(booking_id: str) -> dict | None:
     """One booking's WhatsApp conversation with Gia and everything ops needs beside it: who's handling it, the
-    pre-arrival messages, waiting handoffs, the guest's details and preferences, and their requests."""
+    pre-arrival messages, waiting handoffs, the guest's details, their guest profile (preferences from every stay,
+    each linked to the message it came from) and their requests."""
     b = store.get_booking(booking_id)
     if not b:
         return None
@@ -107,6 +108,7 @@ def conversation(booking_id: str) -> dict | None:
     inbound = store.last_inbound_at(b["guest_phone"])
     staff = {p["id"]: p for p in store.all_staff()}
     tickets = [portfolio.ticket_view(t, {b["villa_id"]: villa}, names, staff, now) for t in rec["tickets"]]
+    profile = preferences.profile(b)
     return {
         "booking": {**portfolio.booking_summary(b, today, villa), "phone": b["guest_phone"],
                     "language": b.get("language"), "villa_id": b["villa_id"], "villa": villa.get("name", b["villa_id"]),
@@ -121,7 +123,8 @@ def conversation(booking_id: str) -> dict | None:
                     for name in scheduler.STEPS if name in steps],
         "handoffs": [{k: h[k] for k in ("id", "reason", "urgency", "status", "at")} for h in rec["handoffs"]],
         "details": store.guest_details(booking_id),
-        "preferences": [{k: p[k] for k in ("category", "preference", "source_quote", "at")} for p in rec["preferences"]],
+        "profile": {k: profile[k] for k in ("guest_id", "since", "stays")},
+        "preferences": profile["preferences"],
         "tickets": tickets,
         # Takeovers and ticket changes, shown as notes and chips in the chat (oldest first).
         "events": [_activity(e, names) for e in reversed(rec["audit"])
@@ -212,8 +215,10 @@ def _activity(entry: dict, names: dict) -> dict:
     elif action == "save_arrival_details":
         fields = ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in d.items() if v not in (None, "", []))
         who, title, text = "ai", "Arrival details saved", fields
-    elif action == "log_preference":
+    elif action in ("log_preference", "preference_saved"):  # log_preference: entries from before guest profiles
         who, title, text = "ai", "Preference saved", f"{d.get('preference', '')} (“{d.get('source_quote', '')}”)"
+    elif action == "preference_removed":
+        who, title, text = "ai", "Preference removed", f"{d.get('preference', '')} (“{d.get('source_quote', '')}”)"
     elif action == "get_villa_info":
         who, title, text = "ai", "Checked villa details", f"Gia looked up the villa for {first}"
     elif action == "get_my_tickets":
@@ -312,8 +317,11 @@ def _event(entry: dict, names: dict, by_ref: dict, villas: dict) -> dict | None:
     if action == "save_arrival_details":
         fields = ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in d.items() if v not in (None, "", []))
         return {**ev, "kind": "profile", "title": f"Arrival details captured for {guest}", "text": fields}
-    if action == "log_preference":
-        return {**ev, "kind": "profile", "title": f"Preference noted for {guest}", "text": d.get("preference", "")}
+    if action == "preference_saved":  # only when the profile changed, not each time Gia repeats one
+        return {**ev, "kind": "profile", "title": f"Preference noted for {guest}",
+                "text": f"{preferences.KIND_LABELS.get(d.get('kind'), 'Likes')} · {d.get('preference', '')}"}
+    if action == "preference_removed":
+        return {**ev, "kind": "profile", "title": f"Preference removed for {guest}", "text": d.get("preference", "")}
     if action in ("oi_booking_confirmed", "oi_booking_cancelled"):
         return {**ev, "kind": "booking", "title": f"Booking {action.removeprefix('oi_booking_')} · {guest}",
                 "text": entry["booking_id"] or ""}

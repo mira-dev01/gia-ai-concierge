@@ -8,7 +8,7 @@ Gia is Lohono's AI guest concierge from the *AI-Native Guest Operations BRD*. Th
 | UC-OPS-05 step 5 | Changing a ticket's status in the ops console messages the guest on WhatsApp automatically |
 | UC-OPS-01 Initiate concierge chat | Welcome on booking confirmation, T-7 and T-1 before check-in, inside each villa's send window. Late bookings get T-7 merged into the welcome; no reply in 24 h gets one reminder; no reply by T-1 (given at least the reminder delay, 24 h by default, to answer) raises a ticket for the control tower and the villa's caretaker and manager. Every message is logged against the booking with its delivery status. Each booking has its own page in the console with the journey, every message and its tickets. See [UC-OPS-01 in detail](#uc-ops-01-initiate-concierge-chat) |
 | UC-OPS-02 Arrival details | Gia collects arrival time, transport, dietary needs, allergies, occasions, kids and pets, conversationally |
-| UC-OPS-09 Preferences | Lasting preferences are logged with the guest's own words as the source |
+| UC-OPS-09 Preferences | What a guest likes, dislikes and wants arranged goes on their **guest profile**, which spans every stay at every villa. Each preference links back to the guest message it came from (with its date and channel). On the next booking Gia already knows them, and so does the welcome. See [UC-OPS-09 in detail](#uc-ops-09-guest-preferences) |
 | UC-OPS-10 Human takeover | Requests for a person, money matters, frustration, and any safety or medical issue go to the control tower list (urgent ones flagged) |
 | BR-01, BR-02 | Gia says it is AI and offers a human; it never promises anything the villa data doesn't allow and offers the listed alternative instead |
 | NFR-03, NFR-04, NFR-08 | Replies in English or Hindi; every action is in an audit log with its tier; if Gia errors, the chat goes to a human |
@@ -84,6 +84,7 @@ app/portfolio.py  The console's shared rules: booking status, occupancy, readine
 app/ops_view.py   Live data for the ops console: the portfolio snapshot it polls, and a conversation, ticket or operator on demand
 app/property_view.py  The Properties register (server-side search, filters, sort, paging) and one property's profile
 app/operators.py  Field operators: routing tickets, telling them on WhatsApp, their DONE / ONSITE / OFFSITE replies
+app/preferences.py  Guest profiles (UC-OPS-09): preferences with the message each came from, used on every later stay
 app/static/ops/   Ops console (React + htm from a CDN, no build step): console.js (shell, Overview, Workflows), properties.js,
                   conversation.js, operations.js, ui.js (shared pieces), live.js (API and formatting), data.js (demo scenarios)
 scripts/chat.py   Terminal chat for testing without WhatsApp
@@ -115,4 +116,18 @@ scripts/chat.py   Terminal chat for testing without WhatsApp
 
 **Automated check.** `python -m tests.uc_ops_01_check` runs every UC-OPS-01 rule against a frozen clock and a throwaway database, with WhatsApp faked and Resend mocked, so nothing is sent. `python -m tests.properties_check` checks the Properties workspace and the portfolio rules behind it (occupancy, booking status, readiness, attention), escalation, resolution notes, message delivery states, and a 320-villa register. `python -m tests.ops_console_check` does the same for the ops console's API: ticket status changes, takeover and hand-back, ops replies (including outside WhatsApp's 24-hour window), handoff resolution, and field operators (routing, onsite first, WhatsApp commands, field-app done, time to resolve, reassignment).
 
-**Templates to submit to Meta** (category Utility, English): `gia_welcome`, `gia_welcome_pre_arrival`, `gia_pre_arrival`, `gia_pre_arrival_reminder`, `gia_arrival_t1`, `gia_staff_alert`, with the exact bodies and buttons in `app/wa_templates.py`. Set `WA_TEMPLATES_LIVE=true` once they're approved; until then `hello_world` goes out and the real text is logged.
+**Templates to submit to Meta** (category Utility, English): `gia_welcome`, `gia_welcome_pre_arrival`, `gia_pre_arrival`, `gia_pre_arrival_reminder`, `gia_arrival_t1`, `gia_staff_alert`, and for returning guests (UC-OPS-09) `gia_welcome_returning` and `gia_pre_arrival_returning`, with the exact bodies and buttons in `app/wa_templates.py`. Set `WA_TEMPLATES_LIVE=true` once they're approved; until then `hello_world` goes out and the real text is logged. If a returning-guest template isn't approved yet, the standard welcome or T-7 template goes out in its place.
+
+## UC-OPS-09 Guest preferences
+
+**Capture.** Gia picks up anything lasting a guest says they like, dislike or want arranged (food and diet, room setup, activities, occasions, routines) from any message, request or feedback, with `log_preference`. Example: "a chef tonight, we love seafood" is a ticket and a food like. She does it silently. If the guest says something no longer holds, she takes it off with `remove_preference`.
+
+**Guest profile.** Preferences belong to the guest, not the booking, so they carry over to every later stay at any villa. The guest is identified by their WhatsApp number until OI sends a guest ID. Each preference records its kind and category, the guest's own words, the date, how it was captured (`whatsapp`, `console` or `terminal`), and the transcript message it came from. The server picks that message by finding the quote in the guest's recent messages, and falls back to the message being answered, so the link never depends on the model. Nothing is saved without a guest message behind it. A repeat isn't saved twice, and a removed preference is kept for the record with the message that removed it.
+
+**Where to see it.** In the console, open a conversation and expand Guest context. Under Guest profile, click a preference to see where and when the guest said it and to jump to that message. `/admin/bookings/<id>` lists the profile with a Source link to each message, and every ticket email carries the profile to the villa team.
+
+**Next stay.** Gia has the profile in her context on every turn and won't ask again for anything on it. For a guest with preferences from an earlier stay, the welcome and T-7 messages say they're remembered: Gia writes them herself inside WhatsApp's 24-hour window, otherwise the `gia_welcome_returning` / `gia_pre_arrival_returning` templates go out.
+
+**Automated check.** `python -m tests.uc_ops_09_check` runs Gia's real tool loop with the model's replies scripted, against a frozen clock and a throwaway database. It covers capture from requests, feedback, dislikes and Hindi, linking to the right message, repeats, removal and re-adding, refusals, the console and admin links, the returning-guest templates and their fallback, and the move of older preferences onto profiles.
+
+To try it on WhatsApp: tell Gia a few preferences, then confirm a new booking for the same number at another villa (console form or `POST /oi/events/booking`). The welcome names what's remembered, and asking Gia about the new stay shows she already knows.

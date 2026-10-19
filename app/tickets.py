@@ -178,6 +178,10 @@ def _context(booking: dict | None, phone: str) -> str:
         host = villa.get("host") or {}
         lines.append(f"Villa team: {on_ground or 'no caretaker or manager assigned'}; "
                      f"host on record {host.get('name', '-')} ({host.get('phone', '-')})")
+        prefs = store.preferences_for_guest(store.guest_id_for(booking))  # UC-OPS-09, from every stay
+        if prefs:
+            lines.append("Guest profile: " + "; ".join(
+                f"{p['kind'] or 'like'}: {p['preference']}" for p in prefs))
     else:
         lines.append(f"Guest: +{phone} (no booking matches this number)")
     convo = store.transcript_for(phone)

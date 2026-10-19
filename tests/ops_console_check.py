@@ -22,7 +22,7 @@ from app import store  # noqa: E402
 clock = {"t": datetime(2026, 10, 10, 11, 0, tzinfo=store.IST)}
 store.now = lambda: clock["t"]  # frozen before main is imported, since importing it seeds the bookings
 
-from app import agent, main, scheduler, tickets, whatsapp  # noqa: E402
+from app import agent, main, preferences, scheduler, tickets, whatsapp  # noqa: E402
 sent = []
 outside_window = {"on": False}
 
@@ -38,7 +38,7 @@ whatsapp._post = fake_post
 gia_calls = []
 
 
-async def fake_reply(phone, text):
+async def fake_reply(phone, text, source=None):
     gia_calls.append(text)
     return f"Gia: {text}"
 
@@ -75,7 +75,8 @@ async def main_async():
     t = tickets.raise_ticket(priya, phone, "maintenance", "high", "AC not cooling", "Master bedroom AC is warm.")
     tickets.raise_ticket(priya, phone, "pre_arrival", "high", "Internal flag", "No reply.", source="uc-ops-01")
     ho = tickets.raise_handoff(priya, phone, "Guest asked for a person", "normal")
-    store.add_preference(priya, "food", "Loves seafood", "we love seafood")
+    said = store.log_message(phone, "LH-24009", "in", "We love seafood")
+    preferences.log(priya, phone, "like", "food", "Loves seafood", "we love seafood", {"message_id": said})
     store.log_message(phone, "LH-24009", "in", "Hi Gia")
 
     s = c.get("/api/state", auth=auth).json()

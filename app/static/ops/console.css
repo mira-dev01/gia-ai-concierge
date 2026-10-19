@@ -816,6 +816,13 @@ label.check { display: flex; align-items: center; gap: 7px; font-size: 13px; col
 .phone-cta:disabled { background: #D9CCC1; color: #6A625C; cursor: not-allowed; }
 
 .prefs .pref { background: var(--bg); border: 1px solid var(--bubble-line); }
+.prefs .pref-kind { font-size: 11px; font-weight: 700; color: var(--muted); align-self: center; min-width: 84px; }
+button.pref { font: inherit; font-size: 12.5px; cursor: pointer; }
+button.pref:hover, button.pref[aria-pressed="true"] { border-color: var(--accent-dark); }
+.pref-source { font-size: 12px; color: var(--muted); }
+.bubble.flash { animation: msg-flash 1.6s ease-out; }
+@keyframes msg-flash { from { box-shadow: 0 0 0 3px var(--accent-dark); } to { box-shadow: 0 0 0 3px transparent; } }
+@media (prefers-reduced-motion: reduce) { .bubble.flash { animation: none; outline: 2px solid var(--accent-dark); } }
 .toast { right: auto; left: 50%; transform: translateX(-50%); }
 @media (max-width: 899px) { .toast { left: 16px; right: 16px; transform: none; } .team-side { align-items: flex-start; } }
 .modal:focus, .drawer:focus { outline: none; }
