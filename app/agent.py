@@ -196,13 +196,17 @@ async def reply(phone: str, text: str) -> str:
     return await _turn(phone, f"[context: {context}]\n{text}", f"Model declined to answer: {text}")
 
 
-async def initiate(phone: str, directive: str) -> str:
-    """Have Gia open a conversation herself (UC-OPS-01 welcome/T-7/T-1), with no guest message to react to."""
+async def initiate(booking: dict, directive: str) -> str:
+    """Have Gia open a conversation herself (UC-OPS-01 welcome/T-7/T-1), with no guest message to react to.
+
+    Takes the exact booking the caller is processing, rather than re-deriving one from the phone number:
+    a guest with more than one booking on the same number would otherwise get the wrong booking's context."""
     stamp = store.now().strftime("%A %d %b %Y, %H:%M IST")
     user_content = (f"[context: now {stamp}]\n[internal note, not from the guest: there is no guest message yet. "
                     f"You are starting this conversation yourself. {directive} Write only your opening message "
                     f"to the guest; never mention or quote this note.]")
-    return await _turn(phone, user_content, f"Model declined to open the conversation: {directive}")
+    return await _turn(booking["guest_phone"], user_content,
+                       f"Model declined to open the conversation: {directive}", booking=booking)
 
 
 def record_outbound(phone: str, booking_id: str | None, text: str) -> None:
@@ -214,9 +218,13 @@ def record_outbound(phone: str, booking_id: str | None, text: str) -> None:
     store.save_history(phone, booking_id, messages)
 
 
-async def _turn(phone: str, user_content: str, refusal_reason: str) -> str:
-    """Run one agent turn (tool-use loop included) and return the text to send to the guest."""
-    booking = store.find_booking(phone)
+async def _turn(phone: str, user_content: str, refusal_reason: str, booking: dict | None = None) -> str:
+    """Run one agent turn (tool-use loop included) and return the text to send to the guest.
+
+    booking: the exact booking to use for context, when the caller already knows it (initiate()). Left to
+    find_booking(phone) for reply(), since an inbound WhatsApp message carries no booking ID of its own."""
+    if booking is None:
+        booking = store.find_booking(phone)
     messages = store.load_history(phone)
     if len(messages) > MAX_HISTORY_MESSAGES:
         messages = []

@@ -272,7 +272,7 @@ async def _send(booking: dict, name: str, merged: bool) -> tuple[str | None, str
     last_in = _parse_dt(store.last_inbound_at(phone))
     if last_in and store.now() - last_in < timedelta(hours=SERVICE_WINDOW_HOURS):
         try:
-            text = await agent.initiate(phone, DIRECTIVES["welcome_merged" if merged else name])
+            text = await agent.initiate(booking, DIRECTIVES["welcome_merged" if merged else name])
         except Exception:
             log.exception("Gia couldn't write the %s message for %s; sending the template instead", name, bid)
             text = None
